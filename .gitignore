@@ -1,0 +1,10 @@
+.gradle/
+build/
+**/build/
+*.iml
+.idea/
+.kotlin/
+local.properties
+
+# Reference gateway binary; built on demand from sources in the same directory.
+interop/reference-gateway/ohttp-reference-gateway
