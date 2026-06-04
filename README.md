@@ -1,1 +1,129 @@
 # ohttp-kotlin-interceptor
+
+An OkHttp `Interceptor` that transparently converts regular HTTP(S) requests to
+configured target hosts into **Oblivious HTTP** (RFC 9458) exchanges. Drop it
+in and your traffic goes through an OHTTP relay; remove it and the same client
+makes ordinary HTTP requests. Designed to work with Fastly's OHTTP relay/gateway
+deployments and any other RFC 9458 implementation.
+
+Pure JVM — no Android-specific code. Crypto is provided exclusively by
+Google Tink (`com.google.crypto.tink:tink:1.21.0`).
+
+## Modules
+
+| Module       | Artifact                  | Purpose                                                                   |
+|--------------|---------------------------|---------------------------------------------------------------------------|
+| `interceptor` | `ohttp-kotlin-interceptor` | The `OhttpInterceptor` and its supporting BHTTP (RFC 9292) + HPKE crypto. |
+| `testing`     | `ohttp-kotlin-testing`    | `InProcessRelay` (fake Fastly) and `InProcessGateway` for integration tests. |
+
+## Usage
+
+```kotlin
+import io.github.gabrielhuff.ohttp.OhttpConfig
+import io.github.gabrielhuff.ohttp.OhttpInterceptor
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+
+val keyConfigBytes: ByteArray = /* Fetch from /.well-known/ohttp-gateway or ship out-of-band */
+val client = OkHttpClient.Builder()
+    .addInterceptor(
+        OhttpInterceptor(
+            mapOf(
+                "api.example.com" to OhttpConfig(
+                    relayUrl = "https://relay.fastly-edge.example/ohttp".toHttpUrl(),
+                    keyConfigBytes = keyConfigBytes,
+                ),
+            )
+        )
+    )
+    .build()
+
+// Calls to https://api.example.com/... now go via OHTTP. Calls to any other
+// host pass through untouched.
+client.newCall(Request.Builder().url("https://api.example.com/v1/things").build()).execute()
+```
+
+### Removing the interceptor
+
+Drop it from the `OkHttpClient.Builder`, or supply an empty map. Either way,
+the rest of your client stack is unaffected — the same OkHttp instance happily
+makes plain HTTP requests.
+
+### Configuration model
+
+The interceptor takes a `Map<String, OhttpConfig>` keyed by **target hostname**
+(exact match against `HttpUrl.host`). Each `OhttpConfig` bundles:
+
+* `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
+  relay endpoint.
+* `keyConfigBytes` — the gateway's published OHTTP Key Configuration
+  (RFC 9458 §3.1), opaque bytes. We deliberately accept the wire bytes rather
+  than a parsed structure so that **rotating keys is a byte-array swap**.
+
+The interceptor uses a dedicated `OkHttpClient` to talk to the relay so the
+relay request is **not** re-intercepted. Provide your own via the second
+constructor argument if you need custom timeouts, proxy, etc.
+
+## Crypto details
+
+* **HPKE base-mode**, suite **DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 /
+  AES-128-GCM** (Fastly/Cloudflare default). Adding more suites is a matter of
+  extending `HpkeSuite` and `KeyConfig.pickSupportedSuite`.
+* The HPKE KEM, KDF, and AEAD primitives come from Tink. Because Tink's
+  `HpkeContext` does not expose HPKE `Export`, we re-implement the **KeySchedule**
+  on top of Tink's `HpkeKdf`/`HpkeAead` primitives and derive the response key
+  per RFC 9458 §4.5 with plain HKDF (JDK `Mac`).
+* A small Java shim in `com.google.crypto.tink.hybrid.internal.OhttpHpkeBridge`
+  exposes two package-private Tink helpers (`hpkeSuiteId`, `kem.encapsulate`)
+  rather than using reflection. If a future Tink release promotes them, the
+  bridge can be deleted.
+
+## Binary HTTP
+
+`io.github.gabrielhuff.ohttp.internal.Bhttp` implements **known-length**
+request/response framing only — that's what RFC 9458 §4 mandates for OHTTP.
+Indeterminate-length framing is intentionally not implemented.
+
+## In-process relay & gateway
+
+```kotlin
+import io.github.gabrielhuff.ohttp.testing.InProcessGateway
+import io.github.gabrielhuff.ohttp.testing.InProcessRelay
+
+val origin = MockWebServer().apply { start() }
+val gateway = InProcessGateway(hostRewriter = { it.newBuilder().host(origin.hostName).port(origin.port).scheme("http").build() })
+val relay = InProcessRelay(gatewayUrl = gateway.url)
+
+val client = OkHttpClient.Builder()
+    .addInterceptor(OhttpInterceptor(mapOf("api.example.com" to OhttpConfig(relay.url, gateway.keyConfigBytes))))
+    .build()
+```
+
+`InProcessRelay` is a real OHTTP relay: it forwards `message/ohttp-req` byte
+streams to the configured gateway without decrypting them.
+
+## Validation
+
+The unit tests in `interceptor/src/test/` cover BHTTP, QUIC varints, RFC 9458
+key configs (including the appendix test vector), and the OHTTP request/response
+crypto round-trip.
+
+The `testing` module's tests cover:
+
+1. **End-to-end self-loop** — `EndToEndTest` exercises
+   client → relay → gateway → origin → gateway → relay → client using only
+   our own implementation. Verifies the interceptor is the only thing standing
+   between OHTTP and plain HTTP.
+
+2. **Reference interop** — `ReferenceGatewayInteropTest` runs the same loop
+   against [`chris-wood/ohttp-go`](https://github.com/chris-wood/ohttp-go),
+   the OHTTP spec author's Go implementation (built on Cloudflare's
+   `circl/hpke`). The Go binary lives in `interop/reference-gateway`; the
+   Gradle test task builds it automatically when `go` is available on PATH and
+   skips the interop test cleanly otherwise.
+
+Run everything with:
+
+```
+gradle test
+```
