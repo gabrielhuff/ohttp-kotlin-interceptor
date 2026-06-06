@@ -1,3 +1,3 @@
 rootProject.name = "ohttp-kotlin-interceptor"
 
-include(":interceptor", ":testing")
+include(":interceptor", ":testing", ":cronet")

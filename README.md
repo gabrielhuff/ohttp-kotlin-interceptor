@@ -15,6 +15,7 @@ Google Tink (`com.google.crypto.tink:tink:1.21.0`).
 |--------------|---------------------------|---------------------------------------------------------------------------|
 | `interceptor` | `ohttp-kotlin-interceptor` | The `OhttpInterceptor` and its supporting BHTTP (RFC 9292) + HPKE crypto. |
 | `testing`     | `ohttp-kotlin-testing`    | `InProcessRelay` (fake Fastly) and `InProcessGateway` for integration tests. |
+| `cronet`      | `ohttp-kotlin-cronet`     | `OhttpCronetEngine` / `OhttpUrlRequest` — Cronet-native wrapper for apps that use raw `CronetEngine` rather than OkHttp. Cronet API is compileOnly; consumers add `org.chromium.net:cronet-api` from Google Maven themselves. |
 
 ## Usage
 
@@ -127,3 +128,54 @@ Run everything with:
 ```
 gradle test
 ```
+
+## Cronet integration
+
+The `cronet` module wraps a `CronetEngine`. Build a Cronet `UrlRequest` via
+`OhttpCronetEngine` instead of the engine directly:
+
+```kotlin
+val ohttpEngine = OhttpCronetEngine(
+    delegate = realCronetEngine,
+    configs = mapOf("api.example.com" to OhttpConfig(relayUrl, keyConfigBytes)),
+)
+
+val request = ohttpEngine.newUrlRequestBuilder(
+    "https://api.example.com/v1/things",
+    callback,
+    callbackExecutor,
+)
+    .setHttpMethod("POST")
+    .addHeader("Content-Type", "application/json")
+    .setUploadDataProvider(uploadProvider, uploadExecutor)
+    .build()
+
+request.start()
+```
+
+Requests to hosts not in the map fall through to the wrapped `CronetEngine`
+verbatim. The relay leg also goes via the wrapped engine, so HTTP/3 and
+connection migration apply to client→relay traffic.
+
+The module depends on Cronet at **compile time only**. Add the real artifact
+in your app's build:
+
+```kotlin
+implementation("org.chromium.net:cronet-api:119.6045.31")
+// And one of the Cronet implementations: cronet-embedded (full),
+// Google Play Services provider, or HttpEngine.
+```
+
+(Cronet artifacts are hosted on `https://maven.google.com/`; add that repo to
+your build if it isn't already.)
+
+### Known limitations vs. native Cronet
+
+- **One-shot.** OHTTP doesn't stream, so request/response bodies are buffered
+  end to end. Don't use this path for large uploads/downloads if memory is
+  tight.
+- **No transparent redirect following.** `UrlRequest.followRedirect()` throws.
+  3xx responses are surfaced as the final response; follow them yourself if
+  needed.
+- **`getStatus`** returns a coarse-grained status (engine internals aren't
+  visible to the wrapper).
