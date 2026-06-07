@@ -29,35 +29,52 @@ tasks.named("compileKotlin", org.jetbrains.kotlin.gradle.tasks.KotlinCompilation
     }
 }
 
-// Build the Go reference gateway used by ReferenceGatewayInteropTest. We don't
-// fail the test task if Go isn't available; the test is conditional.
+// Build the two Rust reference binaries used by the interop tests:
+//   - reference-gateway: martinthomson/ohttp (spec author's `ohttp` crate)
+//   - reference-relay:   payjoin/ohttp-relay (closest pure-Rust relay binary)
+//
+// Both binaries are conditional on `cargo` being available on PATH; the
+// corresponding tests are skipped automatically when their binaries are
+// missing.
 val referenceGatewayDir = file("${rootProject.projectDir}/interop/reference-gateway")
-val referenceGatewayBinary = file("${referenceGatewayDir}/ohttp-reference-gateway")
+val referenceRelayDir = file("${rootProject.projectDir}/interop/reference-relay")
 
-val buildReferenceGateway = tasks.register("buildReferenceGateway") {
-    group = "verification"
-    description = "Builds the chris-wood/ohttp-go reference gateway used for interop tests"
-    doLast {
-        try {
-            val probe = ProcessBuilder("go", "version").redirectErrorStream(true).start()
-            if (probe.waitFor() != 0) {
-                logger.warn("`go` not available; ReferenceGatewayInteropTest will be skipped")
+fun registerCargoBuild(name: String, dir: java.io.File, description: String) =
+    tasks.register(name) {
+        group = "verification"
+        this.description = description
+        doLast {
+            try {
+                val probe = ProcessBuilder("cargo", "--version").redirectErrorStream(true).start()
+                if (probe.waitFor() != 0) {
+                    logger.warn("`cargo` not available; the corresponding interop test will be skipped")
+                    return@doLast
+                }
+            } catch (e: Exception) {
+                logger.warn("`cargo` not available; the corresponding interop test will be skipped")
                 return@doLast
             }
-        } catch (e: Exception) {
-            logger.warn("`go` not available; ReferenceGatewayInteropTest will be skipped")
-            return@doLast
+            val proc = ProcessBuilder("cargo", "build", "--release")
+                .directory(dir)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText()
+            val rc = proc.waitFor()
+            if (rc != 0) throw GradleException("cargo build failed in $dir (rc=$rc):\n$out")
         }
-        val proc = ProcessBuilder("go", "build", "-o", "ohttp-reference-gateway", "./")
-            .directory(referenceGatewayDir)
-            .redirectErrorStream(true)
-            .start()
-        val out = proc.inputStream.bufferedReader().readText()
-        val rc = proc.waitFor()
-        if (rc != 0) throw GradleException("go build failed (rc=$rc):\n$out")
     }
-}
+
+val buildReferenceGateway = registerCargoBuild(
+    "buildReferenceGateway",
+    referenceGatewayDir,
+    "Builds the martinthomson/ohttp reference gateway used for interop tests",
+)
+val buildReferenceRelay = registerCargoBuild(
+    "buildReferenceRelay",
+    referenceRelayDir,
+    "Builds the payjoin/ohttp-relay reference relay used for interop tests",
+)
 
 tasks.named("test").configure {
-    dependsOn(buildReferenceGateway)
+    dependsOn(buildReferenceGateway, buildReferenceRelay)
 }

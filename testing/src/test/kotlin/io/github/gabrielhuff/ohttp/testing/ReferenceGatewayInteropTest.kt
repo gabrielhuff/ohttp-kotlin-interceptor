@@ -9,7 +9,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
-import okio.ByteString.Companion.decodeHex
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.BeforeEach
@@ -18,17 +17,19 @@ import org.junit.jupiter.api.condition.EnabledIf
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.HexFormat
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
- * Interop test: drives the Kotlin OHTTP client against the chris-wood/ohttp-go
- * reference gateway (which uses Cloudflare's circl/hpke). Validates wire-level
+ * Interop test: drives the Kotlin OHTTP client against
+ * Martin Thomson's `ohttp` Rust crate — the spec author's reference
+ * implementation, with `rust-hpke` as the HPKE backend. Validates wire-level
  * compatibility with an independent implementation by the RFC's author.
  *
  * Skipped automatically when the reference gateway binary isn't built; build it
- * with `./gradlew :testing:buildReferenceGateway` (or `go build` directly in
- * `interop/reference-gateway`).
+ * with `./gradlew :testing:buildReferenceGateway` (or `cargo build --release`
+ * directly in `interop/reference-gateway`).
  */
 @EnabledIf("io.github.gabrielhuff.ohttp.testing.ReferenceGatewayInteropTest#binaryAvailable")
 class ReferenceGatewayInteropTest {
@@ -50,7 +51,7 @@ class ReferenceGatewayInteropTest {
         ).redirectErrorStream(false).start()
 
         val (kc, addr) = readGatewayStartup(gatewayProcess)
-        gatewayKeyConfigBytes = kc.decodeHex().toByteArray()
+        gatewayKeyConfigBytes = HexFormat.of().parseHex(kc)
         gatewayAddress = addr
 
         relay = InProcessRelay(gatewayUrl = "http://$gatewayAddress/ohttp".toHttpUrl())
@@ -134,26 +135,24 @@ class ReferenceGatewayInteropTest {
         @JvmStatic
         fun binaryAvailable(): Boolean = binaryPath().canExecute()
 
-        private fun binaryPath(): File {
+        internal fun binaryPath(): File {
             val override = System.getenv("OHTTP_REFERENCE_GATEWAY")
             if (override != null) return File(override)
-            // Locate the binary built by `:testing:buildReferenceGateway`.
-            // Tests run from `<root>/testing`, so walk up to repo root.
             var dir: File? = File(System.getProperty("user.dir"))
             while (dir != null && !File(dir, "settings.gradle.kts").exists()) {
                 dir = dir.parentFile
             }
-            return File(dir, "interop/reference-gateway/ohttp-reference-gateway")
+            return File(dir, "interop/reference-gateway/target/release/ohttp-reference-gateway")
         }
 
-        private data class Startup(val keyConfigHex: String, val address: String)
+        internal data class Startup(val keyConfigHex: String, val address: String)
 
-        private fun readGatewayStartup(process: Process): Startup {
+        internal fun readGatewayStartup(process: Process): Startup {
             val q = LinkedBlockingQueue<String>()
             val reader = BufferedReader(InputStreamReader(process.errorStream))
-            val drainer = Thread({
+            Thread({
                 reader.useLines { lines -> lines.forEach { q.put(it) } }
-            }, "ref-gateway-stderr-drain").also { it.isDaemon = true; it.start() }
+            }, "ref-gateway-stderr-drain").apply { isDaemon = true }.start()
 
             var keyConfig: String? = null
             var address: String? = null
