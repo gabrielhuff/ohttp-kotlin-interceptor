@@ -181,12 +181,15 @@ implementation("org.chromium.net:cronet-api:119.6045.31")
 (Cronet artifacts are hosted on `https://maven.google.com/`; add that repo to
 your build if it isn't already.)
 
-> **Building this repo:** `cronet-api` lives only on Google Maven, not Maven
-> Central. Until the build can resolve it from there, the module compiles and
-> tests against a vendored copy of the real API jar under `cronet/libs/`
-> (wired `compileOnly`, so it never enters the published jar). Swap the
-> `files(...)` dependency in `cronet/build.gradle.kts` for the Maven
-> coordinate above once Google Maven is reachable from your build environment.
+> **Building this repo:** Google's `org.chromium.net:cronet-api` lives only on
+> Google Maven, which isn't reachable from CI here. The build instead resolves the
+> equivalent `com.androidacy:cronet-api` mirror from Maven Central as a normal
+> dependency — but since every `cronet-api` is packaged as an Android `.aar`, and
+> `:cronet` is a plain `kotlin("jvm")` module with no Android plugin, the build
+> fetches the `.aar` artifact only and unpacks its API jar (see the
+> `extractCronetApi` task in `cronet/build.gradle.kts`). The API is `compileOnly`,
+> so it never enters the published jar. Once Google Maven is reachable you can
+> point the dependency at the official coordinate above.
 
 ### Known limitations vs. native Cronet
 
