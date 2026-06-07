@@ -40,6 +40,17 @@ class FakeCronetEngine(
         executor: Executor,
     ): UrlRequest.Builder = FakeBuilder(url, callback, executor)
 
+    // The OHTTP pipeline only ever calls newUrlRequestBuilder; the remaining
+    // CronetEngine surface is not exercised by these tests, so we provide
+    // inert implementations to satisfy the real abstract base class.
+    override fun getVersionString(): String = "FakeCronetEngine/0"
+    override fun shutdown() {}
+    override fun startNetLogToFile(fileName: String, logAll: Boolean) {}
+    override fun stopNetLog() {}
+    override fun getGlobalMetricsDeltas(): ByteArray = ByteArray(0)
+    override fun openConnection(url: java.net.URL): java.net.URLConnection = throw UnsupportedOperationException()
+    override fun createURLStreamHandlerFactory(): java.net.URLStreamHandlerFactory = throw UnsupportedOperationException()
+
     private inner class FakeBuilder(
         private val url: String,
         private val callback: UrlRequest.Callback,

@@ -181,6 +181,13 @@ implementation("org.chromium.net:cronet-api:119.6045.31")
 (Cronet artifacts are hosted on `https://maven.google.com/`; add that repo to
 your build if it isn't already.)
 
+> **Building this repo:** `cronet-api` lives only on Google Maven, not Maven
+> Central. Until the build can resolve it from there, the module compiles and
+> tests against a vendored copy of the real API jar under `cronet/libs/`
+> (wired `compileOnly`, so it never enters the published jar). Swap the
+> `files(...)` dependency in `cronet/build.gradle.kts` for the Maven
+> coordinate above once Google Maven is reachable from your build environment.
+
 ### Known limitations vs. native Cronet
 
 - **One-shot.** OHTTP doesn't stream, so request/response bodies are buffered
