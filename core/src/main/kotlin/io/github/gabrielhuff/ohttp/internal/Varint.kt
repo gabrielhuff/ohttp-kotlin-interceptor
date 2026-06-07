@@ -1,8 +1,8 @@
 package io.github.gabrielhuff.ohttp.internal
 
-import okio.Buffer
-import okio.BufferedSink
-import okio.BufferedSource
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.nio.ByteBuffer
 
 // QUIC variable-length integer encoding (RFC 9000 §16). Used by BHTTP (RFC 9292).
 internal object Varint {
@@ -18,7 +18,7 @@ internal object Varint {
         }
     }
 
-    fun write(sink: BufferedSink, value: Long) {
+    fun write(sink: DataOutputStream, value: Long) {
         require(value >= 0) { "varint must be non-negative: $value" }
         when {
             value < (1L shl 6) -> sink.writeByte(value.toInt())
@@ -29,17 +29,22 @@ internal object Varint {
         }
     }
 
-    fun read(source: BufferedSource): Long {
-        source.require(1)
-        val first = source.peek().readByte().toInt() and 0xFF
+    fun read(source: ByteBuffer): Long {
+        require(source.hasRemaining()) { "varint requires at least one byte" }
+        // Peek the prefix without advancing — branch on the top two bits.
+        val first = source.get(source.position()).toInt() and 0xFF
         return when (first ushr 6) {
-            0 -> (source.readByte().toInt() and 0x3F).toLong()
-            1 -> (source.readShort().toInt() and 0x3FFF).toLong()
-            2 -> (source.readInt().toLong() and 0x3FFFFFFFL)
-            3 -> source.readLong() and 0x3FFFFFFFFFFFFFFFL
+            0 -> (source.get().toInt() and 0x3F).toLong()
+            1 -> (source.short.toInt() and 0x3FFF).toLong()
+            2 -> source.int.toLong() and 0x3FFFFFFFL
+            3 -> source.long and 0x3FFFFFFFFFFFFFFFL
             else -> error("unreachable")
         }
     }
 
-    fun toBytes(value: Long): ByteArray = Buffer().also { write(it, value) }.readByteArray()
+    fun toBytes(value: Long): ByteArray {
+        val baos = ByteArrayOutputStream(encodedSize(value))
+        write(DataOutputStream(baos), value)
+        return baos.toByteArray()
+    }
 }

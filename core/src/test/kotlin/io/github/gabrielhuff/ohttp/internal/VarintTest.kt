@@ -1,10 +1,10 @@
 package io.github.gabrielhuff.ohttp.internal
 
-import okio.Buffer
-import okio.ByteString.Companion.decodeHex
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
+import java.nio.ByteBuffer
+import java.util.HexFormat
 
 class VarintTest {
 
@@ -23,18 +23,19 @@ class VarintTest {
             // Edge value: 4-byte max.
             1_073_741_823L to "bfffffff",
         )
-        for ((value, hex) in vectors) {
-            val expected = hex.decodeHex().toByteArray()
+        val hex = HexFormat.of()
+        for ((value, hexString) in vectors) {
+            val expected = hex.parseHex(hexString)
             val encoded = Varint.toBytes(value)
-            assertEquals(expected.toHex(), encoded.toHex(), "encode $value")
-            val decoded = Varint.read(Buffer().write(expected))
-            assertEquals(value, decoded, "decode $hex")
+            assertEquals(hex.formatHex(expected), hex.formatHex(encoded), "encode $value")
+            val decoded = Varint.read(ByteBuffer.wrap(expected))
+            assertEquals(value, decoded, "decode $hexString")
         }
     }
 
     @Test
     fun `zero encodes to single byte`() {
-        assertEquals("00", Varint.toBytes(0L).toHex())
+        assertEquals("00", HexFormat.of().formatHex(Varint.toBytes(0L)))
     }
 
     @Test

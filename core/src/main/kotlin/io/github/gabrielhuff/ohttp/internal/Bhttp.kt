@@ -1,6 +1,8 @@
 package io.github.gabrielhuff.ohttp.internal
 
-import okio.Buffer
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.nio.ByteBuffer
 
 /**
  * Binary HTTP Messages, RFC 9292 — known-length variant only. RFC 9458 §4
@@ -19,7 +21,8 @@ internal object Bhttp {
     // --- Request ---
 
     fun encodeRequest(request: BhttpRequest): ByteArray {
-        val out = Buffer()
+        val baos = ByteArrayOutputStream(estimatedSize(request))
+        val out = DataOutputStream(baos)
         Varint.write(out, FRAMING_KNOWN_LENGTH_REQUEST.toLong())
 
         // Request Control Data
@@ -39,27 +42,28 @@ internal object Bhttp {
         // Trailers: empty.
         Varint.write(out, 0L)
 
-        return out.readByteArray()
+        return baos.toByteArray()
     }
 
     fun decodeRequest(bytes: ByteArray): BhttpRequest {
-        val src = Buffer().write(bytes)
+        val src = ByteBuffer.wrap(bytes)
         val framing = Varint.read(src)
         require(framing == FRAMING_KNOWN_LENGTH_REQUEST.toLong()) {
             "expected known-length request framing, got $framing"
         }
-        val method = readLengthPrefixedString(src)
-        val scheme = readLengthPrefixedString(src)
-        val authority = readLengthPrefixedString(src)
-        val path = readLengthPrefixedString(src)
+        val method = readLengthPrefixedAscii(src)
+        val scheme = readLengthPrefixedAscii(src)
+        val authority = readLengthPrefixedAscii(src)
+        val path = readLengthPrefixedAscii(src)
         val headers = readFieldSection(src)
         val contentLen = Varint.read(src).toInt()
-        require(src.size >= contentLen) { "BHTTP request truncated in content section" }
-        val body = src.readByteArray(contentLen.toLong())
-        if (!src.exhausted()) {
-            val trailersLen = Varint.read(src)
-            if (trailersLen > 0) src.skip(trailersLen)
-            if (!src.exhausted()) src.clear()
+        require(src.remaining() >= contentLen) { "BHTTP request truncated in content section" }
+        val body = ByteArray(contentLen)
+        src.get(body)
+        if (src.hasRemaining()) {
+            val trailersLen = Varint.read(src).toInt()
+            if (trailersLen > 0 && src.remaining() >= trailersLen) src.position(src.position() + trailersLen)
+            // Any padding is discarded; we ignore the rest of the buffer.
         }
         return BhttpRequest(method, scheme, authority, path, headers, body)
     }
@@ -67,7 +71,8 @@ internal object Bhttp {
     // --- Response ---
 
     fun encodeResponse(response: BhttpResponse): ByteArray {
-        val out = Buffer()
+        val baos = ByteArrayOutputStream(64 + response.body.size)
+        val out = DataOutputStream(baos)
         Varint.write(out, FRAMING_KNOWN_LENGTH_RESPONSE.toLong())
         // No informational responses emitted.
         Varint.write(out, response.statusCode.toLong())
@@ -77,11 +82,11 @@ internal object Bhttp {
         out.write(response.body)
         // Trailers: empty.
         Varint.write(out, 0L)
-        return out.readByteArray()
+        return baos.toByteArray()
     }
 
     fun decodeResponse(bytes: ByteArray): BhttpResponse {
-        val src = Buffer().write(bytes)
+        val src = ByteBuffer.wrap(bytes)
         val framing = Varint.read(src)
         require(framing == FRAMING_KNOWN_LENGTH_RESPONSE.toLong()) {
             "expected known-length response framing, got $framing"
@@ -95,48 +100,68 @@ internal object Bhttp {
             if (status >= 200) break
         }
         val contentLen = Varint.read(src).toInt()
-        require(src.size >= contentLen) { "BHTTP response truncated in content section" }
-        val body = src.readByteArray(contentLen.toLong())
-        if (!src.exhausted()) {
-            val trailersLen = Varint.read(src)
-            if (trailersLen > 0 && src.size >= trailersLen) src.skip(trailersLen)
-            if (!src.exhausted()) src.clear()
+        require(src.remaining() >= contentLen) { "BHTTP response truncated in content section" }
+        val body = ByteArray(contentLen)
+        src.get(body)
+        if (src.hasRemaining()) {
+            val trailersLen = Varint.read(src).toInt()
+            if (trailersLen > 0 && src.remaining() >= trailersLen) src.position(src.position() + trailersLen)
         }
         return BhttpResponse(status, headers, body)
     }
 
     // --- helpers ---
 
-    private fun writeLengthPrefixed(out: Buffer, bytes: ByteArray) {
+    private fun writeLengthPrefixed(out: DataOutputStream, bytes: ByteArray) {
         Varint.write(out, bytes.size.toLong())
         out.write(bytes)
     }
 
-    private fun readLengthPrefixedString(src: Buffer): String {
+    private fun readLengthPrefixedAscii(src: ByteBuffer): String {
         val len = Varint.read(src).toInt()
-        return src.readByteArray(len.toLong()).toString(Charsets.US_ASCII)
+        val arr = ByteArray(len)
+        src.get(arr)
+        return arr.toString(Charsets.US_ASCII)
     }
 
-    private fun writeFieldSection(out: Buffer, fields: List<Pair<String, String>>) {
-        val inner = Buffer()
+    private fun writeFieldSection(out: DataOutputStream, fields: List<Pair<String, String>>) {
+        // Serialize to an inner buffer first so we can prefix the section
+        // with its total length (a varint).
+        val inner = ByteArrayOutputStream(64)
+        val innerOut = DataOutputStream(inner)
         for ((name, value) in fields) {
-            writeLengthPrefixed(inner, name.toByteArray(Charsets.US_ASCII))
-            writeLengthPrefixed(inner, value.toByteArray(Charsets.ISO_8859_1))
+            writeLengthPrefixed(innerOut, name.toByteArray(Charsets.US_ASCII))
+            writeLengthPrefixed(innerOut, value.toByteArray(Charsets.ISO_8859_1))
         }
-        Varint.write(out, inner.size)
-        out.writeAll(inner)
+        Varint.write(out, inner.size().toLong())
+        inner.writeTo(out)
     }
 
-    private fun readFieldSection(src: Buffer): List<Pair<String, String>> {
-        val len = Varint.read(src)
-        require(src.size >= len) { "BHTTP field section truncated" }
-        val inner = Buffer().write(src.readByteArray(len))
+    private fun readFieldSection(src: ByteBuffer): List<Pair<String, String>> {
+        val len = Varint.read(src).toInt()
+        require(src.remaining() >= len) { "BHTTP field section truncated" }
+        // Slice off the section into its own view so length-prefixed reads
+        // inside the section can't bleed past it.
+        val inner = src.slice().limit(len)
+        src.position(src.position() + len)
         val out = ArrayList<Pair<String, String>>()
-        while (!inner.exhausted()) {
-            val name = readLengthPrefixedString(inner)
-            val value = inner.readByteArray(Varint.read(inner)).toString(Charsets.ISO_8859_1)
-            out.add(name to value)
+        while (inner.hasRemaining()) {
+            val nameLen = Varint.read(inner).toInt()
+            val nameBytes = ByteArray(nameLen)
+            inner.get(nameBytes)
+            val valueLen = Varint.read(inner).toInt()
+            val valueBytes = ByteArray(valueLen)
+            inner.get(valueBytes)
+            out.add(nameBytes.toString(Charsets.US_ASCII) to valueBytes.toString(Charsets.ISO_8859_1))
         }
         return out
+    }
+
+    private fun estimatedSize(request: BhttpRequest): Int {
+        // Rough upper bound to avoid most reallocations during encoding.
+        var n = 16 + request.method.length + request.scheme.length + request.authority.length + request.pathWithQuery.length
+        for ((name, value) in request.headers) n += 4 + name.length + value.length
+        n += request.body.size + 8
+        return n
     }
 }

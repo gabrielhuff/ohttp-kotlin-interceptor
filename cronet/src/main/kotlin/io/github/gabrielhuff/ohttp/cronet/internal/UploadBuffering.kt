@@ -2,6 +2,7 @@ package io.github.gabrielhuff.ohttp.cronet.internal
 
 import org.chromium.net.UploadDataProvider
 import org.chromium.net.UploadDataSink
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
@@ -25,7 +26,7 @@ internal object UploadBuffering {
             advertisedLength in 1L..DEFAULT_CHUNK_BYTES.toLong() -> advertisedLength.toInt()
             else -> DEFAULT_CHUNK_BYTES
         }
-        val out = okio.Buffer()
+        val out = ByteArrayOutputStream(maxOf(chunkSize, 64))
         val byteBuffer = ByteBuffer.allocate(chunkSize)
         val future = CompletableFuture<Unit>()
 
@@ -74,6 +75,6 @@ internal object UploadBuffering {
             Thread.currentThread().interrupt()
             throw IOException("UploadDataProvider read interrupted", e)
         }
-        return out.readByteArray()
+        return out.toByteArray()
     }
 }
