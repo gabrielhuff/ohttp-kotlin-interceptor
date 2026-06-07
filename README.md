@@ -181,6 +181,17 @@ implementation("org.chromium.net:cronet-api:119.6045.31")
 (Cronet artifacts are hosted on `https://maven.google.com/`; add that repo to
 your build if it isn't already.)
 
+> **Building this repo:** Google's `org.chromium.net:cronet-api` lives only on
+> Google Maven, which isn't reachable from CI here, so the build resolves the
+> equivalent `com.androidacy:cronet-api` mirror from Maven Central as a normal
+> dependency. Since every `cronet-api` is packaged as an Android `.aar` and
+> `:cronet` is a plain `kotlin("jvm")` module with no Android plugin, an artifact
+> transform (`ExtractAarJars` in `cronet/build.gradle.kts`) unpacks the API jar from
+> the `.aar` — the same mechanism the Android Gradle Plugin uses internally. The API
+> is `compileOnly`, so it never enters the published jar. Once Google Maven is
+> reachable you can point the coordinate at the official artifact above; it's an
+> `.aar` too, so the transform keeps working unchanged.
+
 ### Known limitations vs. native Cronet
 
 - **One-shot.** OHTTP doesn't stream, so request/response bodies are buffered
