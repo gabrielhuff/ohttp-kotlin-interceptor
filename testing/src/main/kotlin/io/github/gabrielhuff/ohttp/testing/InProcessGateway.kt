@@ -1,6 +1,5 @@
 package io.github.gabrielhuff.ohttp.testing
 
-import com.google.crypto.tink.subtle.X25519
 import io.github.gabrielhuff.ohttp.KeyConfig
 import io.github.gabrielhuff.ohttp.internal.Bhttp
 import io.github.gabrielhuff.ohttp.internal.HpkeSuite
@@ -16,11 +15,15 @@ import java.io.Closeable
 
 /**
  * In-process OHTTP gateway, used as the upstream for [InProcessRelay] in
- * end-to-end tests. It generates an X25519 keypair on construction (or
- * accepts an externally supplied one), exposes the corresponding key
+ * end-to-end tests. Generates the appropriate HPKE keypair for the
+ * requested [Suite] on construction, exposes the corresponding key
  * configuration via [keyConfigBytes], decapsulates incoming OHTTP requests,
  * dispatches the decoded HTTP request through [originClient], and re-wraps
  * the response.
+ *
+ * Default [Suite] is the Fastly/Cloudflare baseline
+ * (X25519+HKDF-SHA256+AES-128-GCM) but the constructor accepts any
+ * combination of the IDs in RFC 9180 §7 the library supports.
  *
  * If [hostRewriter] is set, the BHTTP `:authority` is rewritten before
  * dispatch. Useful when the encapsulated request is addressed to e.g.
@@ -28,22 +31,38 @@ import java.io.Closeable
  */
 public class InProcessGateway @JvmOverloads constructor(
     public val keyId: Int = 0x01,
+    public val suiteIds: Suite = Suite.X25519_HKDFSHA256_AES128GCM,
     private val originClient: OkHttpClient = OkHttpClient(),
     private val server: MockWebServer = MockWebServer(),
     private val hostRewriter: ((HttpUrl) -> HttpUrl)? = null,
 ) : Closeable {
 
-    private val suite: HpkeSuite = HpkeSuite.X25519_SHA256_AES128GCM
-    private val privateKey: ByteArray = X25519.generatePrivateKey()
-    private val publicKey: ByteArray = X25519.publicFromPrivate(privateKey)
-    private val gatewayKey = Ohttp.GatewayKey(keyId, suite, privateKey, publicKey)
+    /** Stable HPKE suite identifier used for both the key config and the wire header. */
+    public data class Suite(val kemId: Int, val kdfId: Int, val aeadId: Int) {
+        public companion object {
+            public val X25519_HKDFSHA256_AES128GCM: Suite = Suite(0x0020, 0x0001, 0x0001)
+            public val X25519_HKDFSHA256_AES256GCM: Suite = Suite(0x0020, 0x0001, 0x0002)
+            public val X25519_HKDFSHA256_CHACHA20POLY1305: Suite = Suite(0x0020, 0x0001, 0x0003)
+            public val P256_HKDFSHA256_AES128GCM: Suite = Suite(0x0010, 0x0001, 0x0001)
+            public val P384_HKDFSHA384_AES256GCM: Suite = Suite(0x0011, 0x0002, 0x0002)
+            public val P521_HKDFSHA512_AES256GCM: Suite = Suite(0x0012, 0x0003, 0x0002)
+        }
+    }
+
+    private val hpkeSuite: HpkeSuite = HpkeSuite(
+        kemId = idToBytes(suiteIds.kemId),
+        kdfId = idToBytes(suiteIds.kdfId),
+        aeadId = idToBytes(suiteIds.aeadId),
+    )
+    private val keyPair = HpkeKeyGen.generate(suiteIds.kemId)
+    private val gatewayKey = Ohttp.GatewayKey(keyId, hpkeSuite, keyPair.privateKey, keyPair.publicKey)
 
     public val keyConfig: KeyConfig = KeyConfig(
         keyId = keyId,
-        kemId = 0x0020, // X25519
-        publicKey = publicKey,
+        kemId = suiteIds.kemId,
+        publicKey = keyPair.publicKey,
         symmetricAlgorithms = listOf(
-            KeyConfig.SymmetricAlgorithmPair(kdfId = 0x0001, aeadId = 0x0001), // HKDF-SHA256, AES-128-GCM
+            KeyConfig.SymmetricAlgorithmPair(kdfId = suiteIds.kdfId, aeadId = suiteIds.aeadId),
         ),
     )
 
@@ -101,5 +120,10 @@ public class InProcessGateway @JvmOverloads constructor(
             .setResponseCode(200)
             .setHeader("Content-Type", Ohttp.RESPONSE_MEDIA_TYPE)
             .setBody(okio.Buffer().write(encResp))
+    }
+
+    private companion object {
+        private fun idToBytes(id: Int): ByteArray =
+            byteArrayOf((id ushr 8 and 0xFF).toByte(), (id and 0xFF).toByte())
     }
 }
