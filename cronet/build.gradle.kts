@@ -1,30 +1,77 @@
-// The Cronet API classes (org.chromium.net.*) come from `cronet-api`, resolved as
-// a normal Maven dependency from Maven Central — nothing is vendored in the repo.
+import org.gradle.api.artifacts.transform.CacheableTransform
+import org.gradle.api.artifacts.transform.InputArtifact
+import org.gradle.api.artifacts.transform.TransformAction
+import org.gradle.api.artifacts.transform.TransformOutputs
+import org.gradle.api.artifacts.transform.TransformParameters
+import org.gradle.api.file.FileSystemLocation
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import java.util.zip.ZipFile
+
+// === Cronet API resolution ===
+// The org.chromium.net.* classes come from `cronet-api`, resolved as a normal
+// Maven dependency from Maven Central — nothing is vendored in the repo.
 //
-// The catch: every published `cronet-api` (Google's `org.chromium.net:cronet-api`
-// and the `com.androidacy:cronet-api` mirror) is packaged as an Android `.aar`,
-// and this module is intentionally a plain `kotlin("jvm")` library with no Android
-// Gradle Plugin — so Gradle can't consume the `.aar` variant directly. We therefore
-// fetch the `.aar` artifact only (the `@aar` notation skips variant matching) and
-// unpack the real API jar it carries at `libs/cronet_api.jar`.
+// The wrinkle: every published `cronet-api` (Google's `org.chromium.net:cronet-api`
+// and the `com.androidacy:cronet-api` mirror alike) ships as an Android `.aar`, and
+// this module is intentionally a plain `kotlin("jvm")` library with no Android
+// Gradle Plugin — so Gradle can't consume the `.aar` variant directly. We register
+// an artifact transform that unpacks the jar(s) carried inside the `.aar`
+// (`classes.jar` and any `libs/*.jar`). This is the same mechanism AGP uses
+// internally; it's cacheable and lazy, so the rest of the build just sees a jar.
 //
-// The API is wired `compileOnly` so it never lands in our published jar — we don't
+// The API is wired `compileOnly`, so it never lands in our published jar — we don't
 // want to claim ownership of org.chromium.net classes; at runtime consumers supply
 // their own Cronet implementation (cronet-embedded, Play Services, HttpEngine, …).
 //
 // TODO: once Google's Maven repo (https://maven.google.com/) is reachable from the
-// build, this can collapse to `compileOnly("org.chromium.net:cronet-api:<version>")`
-// (still `@aar`-unpacked here unless/until a jar variant is offered).
-val cronetApiAar: Configuration by configurations.creating
-val extractCronetApi = tasks.register<Copy>("extractCronetApi") {
-    from(provider { zipTree(cronetApiAar.singleFile) }) {
-        include("libs/cronet_api.jar")
-        eachFile { relativePath = RelativePath(true, "cronet-api.jar") }
-        includeEmptyDirs = false
+// build, point the coordinate below at `org.chromium.net:cronet-api:<version>` — the
+// transform keeps working since that artifact is an `.aar` too.
+
+@CacheableTransform
+abstract class ExtractAarJars : TransformAction<TransformParameters.None> {
+    @get:InputArtifact
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val inputAar: Provider<FileSystemLocation>
+
+    override fun transform(outputs: TransformOutputs) {
+        val aar = inputAar.get().asFile
+        ZipFile(aar).use { zip ->
+            zip.entries().asSequence()
+                .filter { entry ->
+                    !entry.isDirectory && entry.size > 0L && entry.name.endsWith(".jar") &&
+                        (entry.name == "classes.jar" || entry.name.startsWith("libs/"))
+                }
+                .forEach { entry ->
+                    val out = outputs.file(entry.name.substringAfterLast('/'))
+                    zip.getInputStream(entry).use { input ->
+                        out.outputStream().use { input.copyTo(it) }
+                    }
+                }
+        }
     }
-    into(layout.buildDirectory.dir("cronet-api"))
 }
-val cronetApi = files(extractCronetApi.map { it.destinationDir.resolve("cronet-api.jar") })
+
+val artifactType = Attribute.of("artifactType", String::class.java)
+val cronetClasses = "cronet-api-classes"
+
+dependencies {
+    registerTransform(ExtractAarJars::class) {
+        from.attribute(artifactType, "aar")
+        to.attribute(artifactType, cronetClasses)
+    }
+}
+
+// Resolvable configuration that holds the cronet-api `.aar`. `@aar` fetches the
+// artifact directly (no variant matching), and the artifactView below runs the
+// transform to hand back the unpacked jar(s).
+val cronetApiAar: Configuration by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+val cronetApi = cronetApiAar.incoming.artifactView {
+    attributes.attribute(artifactType, cronetClasses)
+}.files
 
 val core = project(":core")
 
