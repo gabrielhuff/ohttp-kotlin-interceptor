@@ -117,12 +117,23 @@ The `testing` module's tests cover:
    our own implementation. Verifies the interceptor is the only thing standing
    between OHTTP and plain HTTP.
 
-2. **Reference interop** — `ReferenceGatewayInteropTest` runs the same loop
-   against [`chris-wood/ohttp-go`](https://github.com/chris-wood/ohttp-go),
-   the OHTTP spec author's Go implementation (built on Cloudflare's
-   `circl/hpke`). The Go binary lives in `interop/reference-gateway`; the
-   Gradle test task builds it automatically when `go` is available on PATH and
-   skips the interop test cleanly otherwise.
+2. **Reference gateway interop** — `ReferenceGatewayInteropTest` runs the
+   same loop against [`martinthomson/ohttp`](https://github.com/martinthomson/ohttp),
+   the OHTTP spec author's Rust implementation (using the `rust-hpke`
+   backend, so no NSS install required). The wrapper binary lives in
+   `interop/reference-gateway`; the Gradle test task builds it automatically
+   when `cargo` is available on PATH and skips the interop test cleanly
+   otherwise.
+
+3. **Reference relay interop** — `ReferenceRelayInteropTest` chains a
+   second reference: [`payjoin/ohttp-relay`](https://github.com/payjoin/ohttp-relay)
+   (pure-Rust on hyper/tokio; the closest equivalent to a martinthomson-
+   maintained relay, which doesn't exist). Topology: client →
+   reference-relay (payjoin) → reference-gateway (martinthomson) → origin.
+   Validates wire-level HTTP plumbing across two independent implementations.
+   The relay performs a BIP77 opt-in probe of the gateway before forwarding;
+   our reference gateway answers that probe positively so the chain can
+   form.
 
 Run everything with:
 

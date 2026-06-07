@@ -6,5 +6,7 @@ build/
 .kotlin/
 local.properties
 
-# Reference gateway binary; built on demand from sources in the same directory.
-interop/reference-gateway/ohttp-reference-gateway
+# Rust build artifacts for the reference binaries (Cargo.lock IS committed
+# for reproducible interop runs).
+interop/reference-gateway/target/
+interop/reference-relay/target/
