@@ -25,8 +25,8 @@ public class KeyConfig internal constructor(
     // First (KDF, AEAD) pair from the config that we can actually instantiate.
     internal fun pickSupportedSuite(): HpkeSuite {
         val kemBytes = idToBytes(kemId, 2)
-        check(kemBytes.contentEquals(HpkeUtil.X25519_HKDF_SHA256_KEM_ID)) {
-            "unsupported KEM 0x${"%04x".format(kemId)} (only X25519 is wired up; extend HpkeSuite to add more)"
+        check(SUPPORTED_KEM_IDS.any { it.contentEquals(kemBytes) }) {
+            "unsupported KEM 0x${"%04x".format(kemId)}"
         }
         for (pair in symmetricAlgorithms) {
             val kdfBytes = idToBytes(pair.kdfId, 2)
@@ -39,6 +39,15 @@ public class KeyConfig internal constructor(
     }
 
     public companion object {
+        // Full set of HPKE primitives we accept from a published key
+        // configuration. Tink's HpkePrimitiveFactory implements all five KEMs
+        // and three KDF / AEAD pairs each; see RFC 9180 §7 for the registry.
+        private val SUPPORTED_KEM_IDS = listOf(
+            HpkeUtil.X25519_HKDF_SHA256_KEM_ID,
+            HpkeUtil.P256_HKDF_SHA256_KEM_ID,
+            HpkeUtil.P384_HKDF_SHA384_KEM_ID,
+            HpkeUtil.P521_HKDF_SHA512_KEM_ID,
+        )
         private val SUPPORTED_KDF_IDS = listOf(
             HpkeUtil.HKDF_SHA256_KDF_ID,
             HpkeUtil.HKDF_SHA384_KDF_ID,
