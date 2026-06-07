@@ -76,7 +76,7 @@ class ReferenceGatewayInteropTest {
         val client = OkHttpClient.Builder()
             .addInterceptor(
                 OhttpInterceptor(
-                    mapOf("api.example.com" to OhttpConfig(relay.url, gatewayKeyConfigBytes))
+                    mapOf("api.example.com" to OhttpConfig(relay.url.toString(), gatewayKeyConfigBytes))
                 )
             )
             .build()
@@ -109,7 +109,7 @@ class ReferenceGatewayInteropTest {
         val client = OkHttpClient.Builder()
             .addInterceptor(
                 OhttpInterceptor(
-                    mapOf("api.example.com" to OhttpConfig(relay.url, gatewayKeyConfigBytes))
+                    mapOf("api.example.com" to OhttpConfig(relay.url.toString(), gatewayKeyConfigBytes))
                 )
             )
             .build()

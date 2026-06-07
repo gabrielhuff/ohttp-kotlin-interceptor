@@ -47,7 +47,7 @@ class EndToEndTest {
 
     private fun makeClient(): OkHttpClient {
         val configs = mapOf(
-            "api.example.com" to OhttpConfig(relay.url, gateway.keyConfigBytes),
+            "api.example.com" to OhttpConfig(relay.url.toString(), gateway.keyConfigBytes),
         )
         return OkHttpClient.Builder()
             .addInterceptor(OhttpInterceptor(configs))

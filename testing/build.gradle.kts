@@ -1,10 +1,13 @@
-// The testing module reaches into the interceptor's `internal` APIs (BHTTP +
-// OHTTP gateway routines) so that the in-process gateway and relay don't have
-// to be promoted to the public API surface. -Xfriend-paths grants this access.
+// The testing module reaches into both :core's BHTTP/OHTTP internals and
+// :interceptor's OkHttp adapter (also internal) so the in-process gateway
+// doesn't have to promote anything to the public API. -Xfriend-paths grants
+// this access against both jars.
+val core = project(":core")
 val interceptor = project(":interceptor")
 
 dependencies {
     api(interceptor)
+    api(core)
     api("com.squareup.okhttp3:mockwebserver:4.12.0")
     api("com.squareup.okhttp3:okhttp:4.12.0")
 
@@ -13,9 +16,13 @@ dependencies {
 }
 
 tasks.named("compileKotlin", org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask::class.java).configure {
+    val coreJar = core.tasks.named("jar")
     val interceptorJar = interceptor.tasks.named("jar")
-    dependsOn(interceptorJar)
+    dependsOn(coreJar, interceptorJar)
     compilerOptions {
+        freeCompilerArgs.add(
+            coreJar.flatMap { (it as Jar).archiveFile }.map { "-Xfriend-paths=${it.asFile.absolutePath}" }
+        )
         freeCompilerArgs.add(
             interceptorJar.flatMap { (it as Jar).archiveFile }.map { "-Xfriend-paths=${it.asFile.absolutePath}" }
         )

@@ -5,10 +5,9 @@ import io.github.gabrielhuff.ohttp.KeyConfig
 import io.github.gabrielhuff.ohttp.internal.Bhttp
 import io.github.gabrielhuff.ohttp.internal.HpkeSuite
 import io.github.gabrielhuff.ohttp.internal.Ohttp
+import io.github.gabrielhuff.ohttp.okhttp.OkHttpBhttpAdapter
 import okhttp3.HttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -79,15 +78,16 @@ public class InProcessGateway @JvmOverloads constructor(
         } catch (t: Throwable) {
             return MockResponse().setResponseCode(400).setBody("decapsulation failed: ${t.message}")
         }
-        val decoded = try {
+        val bhttpReq = try {
             Bhttp.decodeRequest(decReq.plaintext)
         } catch (t: Throwable) {
             return MockResponse().setResponseCode(400).setBody("BHTTP decode failed: ${t.message}")
         }
 
+        val decodedRequest = OkHttpBhttpAdapter.fromBhttp(bhttpReq)
         val dispatched = hostRewriter?.let { rewriter ->
-            decoded.newBuilder().url(rewriter(decoded.url)).build()
-        } ?: decoded
+            decodedRequest.newBuilder().url(rewriter(decodedRequest.url)).build()
+        } ?: decodedRequest
 
         val upstream = try {
             originClient.newCall(dispatched).execute()
@@ -95,8 +95,8 @@ public class InProcessGateway @JvmOverloads constructor(
             return MockResponse().setResponseCode(502).setBody("origin fetch failed: ${t.message}")
         }
 
-        val bhttpResp = upstream.use { Bhttp.encodeResponse(it) }
-        val encResp = Ohttp.encapsulateResponse(decReq.context, bhttpResp)
+        val bhttpRespBytes = upstream.use { Bhttp.encodeResponse(OkHttpBhttpAdapter.toBhttp(it)) }
+        val encResp = Ohttp.encapsulateResponse(decReq.context, bhttpRespBytes)
         return MockResponse()
             .setResponseCode(200)
             .setHeader("Content-Type", Ohttp.RESPONSE_MEDIA_TYPE)

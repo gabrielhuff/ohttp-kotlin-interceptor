@@ -10,17 +10,19 @@ val cronetApiStub = sourceSets.create("cronetApiStub") {
 
 val cronetApiStubClasspath = files(cronetApiStub.output.classesDirs)
 
-val interceptor = project(":interceptor")
+val core = project(":core")
 
 dependencies {
-    api(interceptor)
-    api("com.squareup.okhttp3:okhttp:4.12.0")
+    // No OkHttp on the production classpath — :core gives us neutral BHTTP /
+    // OHTTP types so this module stays "Cronet, not OkHttp".
+    api(core)
 
     compileOnly(cronetApiStubClasspath)
 
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation(project(":testing"))
     // Tests use the same stub surface as compile (they aren't real Cronet,
     // but we exercise the abstract API end-to-end via a FakeCronetEngine).
@@ -28,14 +30,13 @@ dependencies {
     testRuntimeOnly(cronetApiStubClasspath)
 }
 
-// Same reasoning as ':testing': reach into ':interceptor' internals (BHTTP +
-// OHTTP) to avoid promoting them to public API.
+// Friend access to :core's internals (BhttpRequest, Bhttp, Ohttp).
 tasks.named("compileKotlin", org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask::class.java).configure {
-    val interceptorJar = interceptor.tasks.named("jar")
-    dependsOn(interceptorJar)
+    val coreJar = core.tasks.named("jar")
+    dependsOn(coreJar)
     compilerOptions {
         freeCompilerArgs.add(
-            interceptorJar.flatMap { (it as Jar).archiveFile }.map { "-Xfriend-paths=${it.asFile.absolutePath}" }
+            coreJar.flatMap { (it as Jar).archiveFile }.map { "-Xfriend-paths=${it.asFile.absolutePath}" }
         )
     }
 }

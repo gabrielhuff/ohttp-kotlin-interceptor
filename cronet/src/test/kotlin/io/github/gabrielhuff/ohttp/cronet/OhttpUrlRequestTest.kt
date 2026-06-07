@@ -40,7 +40,7 @@ class OhttpUrlRequestTest {
         relay = InProcessRelay(gatewayUrl = gateway.url)
         engine = OhttpCronetEngine(
             delegate = FakeCronetEngine(),
-            configs = mapOf("api.example.com" to OhttpConfig(relay.url, gateway.keyConfigBytes)),
+            configs = mapOf("api.example.com" to OhttpConfig(relay.url.toString(), gateway.keyConfigBytes)),
         )
     }
 

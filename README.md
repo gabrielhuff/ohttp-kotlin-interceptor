@@ -11,11 +11,12 @@ Google Tink (`com.google.crypto.tink:tink:1.21.0`).
 
 ## Modules
 
-| Module       | Artifact                  | Purpose                                                                   |
-|--------------|---------------------------|---------------------------------------------------------------------------|
-| `interceptor` | `ohttp-kotlin-interceptor` | The `OhttpInterceptor` and its supporting BHTTP (RFC 9292) + HPKE crypto. |
-| `testing`     | `ohttp-kotlin-testing`    | `InProcessRelay` (fake Fastly) and `InProcessGateway` for integration tests. |
-| `cronet`      | `ohttp-kotlin-cronet`     | `OhttpCronetEngine` / `OhttpUrlRequest` — Cronet-native wrapper for apps that use raw `CronetEngine` rather than OkHttp. Cronet API is compileOnly; consumers add `org.chromium.net:cronet-api` from Google Maven themselves. |
+| Module        | Artifact                   | Purpose                                                                                                                                                                                                                  |
+|---------------|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `core`        | `ohttp-kotlin-core`        | HTTP-stack-agnostic implementation: BHTTP (RFC 9292), HPKE Base + Export on Tink primitives, OHTTP encapsulation (RFC 9458), `KeyConfig`, `OhttpConfig`. Depends only on Tink + Okio. No OkHttp.                          |
+| `interceptor` | `ohttp-kotlin-interceptor` | `OhttpInterceptor` for OkHttp, plus the small `OkHttpBhttpAdapter` that translates between OkHttp `Request`/`Response` and `:core`'s neutral BHTTP types.                                                                  |
+| `testing`     | `ohttp-kotlin-testing`     | `InProcessRelay` (fake Fastly) and `InProcessGateway` for integration tests.                                                                                                                                              |
+| `cronet`      | `ohttp-kotlin-cronet`      | `OhttpCronetEngine` / `OhttpUrlRequest` — Cronet-native wrapper that talks straight to `:core` (no OkHttp on the runtime classpath). Cronet API is compileOnly; consumers add `org.chromium.net:cronet-api` from Google Maven. |
 
 ## Usage
 
@@ -31,7 +32,7 @@ val client = OkHttpClient.Builder()
         OhttpInterceptor(
             mapOf(
                 "api.example.com" to OhttpConfig(
-                    relayUrl = "https://relay.fastly-edge.example/ohttp".toHttpUrl(),
+                    relayUrl = "https://relay.fastly-edge.example/ohttp",
                     keyConfigBytes = keyConfigBytes,
                 ),
             )
@@ -96,7 +97,7 @@ val gateway = InProcessGateway(hostRewriter = { it.newBuilder().host(origin.host
 val relay = InProcessRelay(gatewayUrl = gateway.url)
 
 val client = OkHttpClient.Builder()
-    .addInterceptor(OhttpInterceptor(mapOf("api.example.com" to OhttpConfig(relay.url, gateway.keyConfigBytes))))
+    .addInterceptor(OhttpInterceptor(mapOf("api.example.com" to OhttpConfig(relay.url.toString(), gateway.keyConfigBytes))))
     .build()
 ```
 

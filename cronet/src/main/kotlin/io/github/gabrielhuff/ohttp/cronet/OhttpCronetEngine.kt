@@ -1,9 +1,10 @@
 package io.github.gabrielhuff.ohttp.cronet
 
 import io.github.gabrielhuff.ohttp.OhttpConfig
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.chromium.net.CronetEngine
 import org.chromium.net.UrlRequest
+import java.net.URI
+import java.net.URISyntaxException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
@@ -47,7 +48,7 @@ public class OhttpCronetEngine @JvmOverloads constructor(
         callback: UrlRequest.Callback,
         executor: Executor,
     ): UrlRequest.Builder {
-        val host = url.toHttpUrlOrNull()?.host
+        val host = try { URI(url).host } catch (e: URISyntaxException) { null }
         val config = host?.let { configs[it] }
         return if (config == null) {
             delegate.newUrlRequestBuilder(url, callback, executor)

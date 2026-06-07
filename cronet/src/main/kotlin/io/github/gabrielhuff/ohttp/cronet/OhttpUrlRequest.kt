@@ -3,22 +3,22 @@ package io.github.gabrielhuff.ohttp.cronet
 import io.github.gabrielhuff.ohttp.OhttpConfig
 import io.github.gabrielhuff.ohttp.cronet.internal.ByteArrayUploadDataProvider
 import io.github.gabrielhuff.ohttp.cronet.internal.OhttpCronetException
+import io.github.gabrielhuff.ohttp.cronet.internal.SerialExecutor
 import io.github.gabrielhuff.ohttp.cronet.internal.SynthesizedUrlResponseInfo
 import io.github.gabrielhuff.ohttp.cronet.internal.UploadBuffering
 import io.github.gabrielhuff.ohttp.internal.Bhttp
+import io.github.gabrielhuff.ohttp.internal.BhttpRequest
 import io.github.gabrielhuff.ohttp.internal.Ohttp
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.chromium.net.CronetEngine
 import org.chromium.net.CronetException
 import org.chromium.net.UploadDataProvider
 import org.chromium.net.UrlRequest
 import org.chromium.net.UrlResponseInfo
 import java.io.ByteArrayOutputStream
+import java.net.URI
 import java.nio.ByteBuffer
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
-import okhttp3.Request as OkRequest
 
 /**
  * `org.chromium.net.UrlRequest` implementation that performs the OHTTP
@@ -29,10 +29,10 @@ import okhttp3.Request as OkRequest
  *  1. [start] buffers the user's upload (via [UploadDataProvider]) on
  *     [workExecutor], BHTTP-encodes the request, OHTTP-encapsulates it, and
  *     issues a relay `UrlRequest` through the delegate [CronetEngine].
- *  2. The relay response is buffered, decapsulated, decoded back to an
- *     `okhttp3.Response`, and surfaced to the user via the standard
- *     `onResponseStarted` / `onReadCompleted` / `onSucceeded` callback
- *     sequence.
+ *  2. The relay response is buffered, decapsulated, decoded back to a
+ *     [io.github.gabrielhuff.ohttp.internal.BhttpResponse], and surfaced to
+ *     the user via the standard `onResponseStarted` / `onReadCompleted` /
+ *     `onSucceeded` callback sequence.
  *
  * Known limitations vs. native Cronet:
  *  - Streaming is buffered (OHTTP is one-shot). Large request/response bodies
@@ -91,27 +91,32 @@ public class OhttpUrlRequest internal constructor(
 
     public override fun read(buffer: ByteBuffer) {
         require(buffer.hasRemaining()) { "read() called with a full ByteBuffer" }
-        val (body, offsetBefore, info, isLast) = synchronized(lock) {
+        val info: SynthesizedUrlResponseInfo
+        val deliveredBytes: Int
+        val isLast: Boolean
+        synchronized(lock) {
+            // Cronet contract is that the user stops calling read() once
+            // onSucceeded fires, but the user's onReadCompleted may queue one
+            // last read() before the onSucceeded callback runs — tolerate it.
+            if (state == State.SUCCEEDED || state == State.FAILED || state == State.CANCELED) return
             check(state == State.DELIVERING) { "read() called in state $state" }
-            val toCopy = minOf(buffer.remaining(), responseBody.size - bodyOffset)
-            buffer.put(responseBody, bodyOffset, toCopy)
-            bodyOffset += toCopy
-            val info = responseInfo!!
-            info.addReceivedBytes(toCopy.toLong())
-            ReadOutcome(responseBody, bodyOffset, info, bodyOffset == responseBody.size)
+            deliveredBytes = minOf(buffer.remaining(), responseBody.size - bodyOffset)
+            buffer.put(responseBody, bodyOffset, deliveredBytes)
+            bodyOffset += deliveredBytes
+            info = responseInfo!!
+            info.addReceivedBytes(deliveredBytes.toLong())
+            isLast = bodyOffset == responseBody.size
+            // Eagerly transition before scheduling so re-entrant read() inside
+            // the user's onReadCompleted callback hits the SUCCEEDED branch
+            // above and silently returns rather than re-triggering the chain.
+            if (isLast) state = State.SUCCEEDED
         }
-        userExecutor.execute { userCallback.onReadCompleted(this, info, buffer) }
+        if (deliveredBytes > 0) {
+            userExecutor.execute { userCallback.onReadCompleted(this, info, buffer) }
+        }
         if (isLast) {
-            userExecutor.execute {
-                val shouldFinish = synchronized(lock) {
-                    if (state == State.DELIVERING) { state = State.SUCCEEDED; true } else false
-                }
-                if (shouldFinish) userCallback.onSucceeded(this, info)
-            }
+            userExecutor.execute { userCallback.onSucceeded(this, info) }
         }
-        // Reference unused locals to satisfy destructuring without warnings.
-        @Suppress("UNUSED_VARIABLE") val unused1 = body
-        @Suppress("UNUSED_VARIABLE") val unused2 = offsetBefore
     }
 
     public override fun followRedirect() {
@@ -143,20 +148,24 @@ public class OhttpUrlRequest internal constructor(
                 ?: ByteArray(0)
             if (isCanceled()) return
 
-            val okRequest = buildOkHttpRequest(bodyBytes)
-            val bhttp = Bhttp.encodeRequest(okRequest)
-            val encapsulated = Ohttp.encapsulateRequest(config.keyConfig, bhttp)
+            val bhttpReq = buildBhttpRequest(bodyBytes)
+            val bhttpBytes = Bhttp.encodeRequest(bhttpReq)
+            val encapsulated = Ohttp.encapsulateRequest(config.keyConfig, bhttpBytes)
 
+            // Per-request serial executor: the underlying workExecutor may be a
+            // thread pool, but the relay UrlRequest's onReadCompleted /
+            // onSucceeded callbacks share a buffer and MUST run sequentially.
+            val relayExecutor = SerialExecutor(workExecutor)
             val relayCallback = RelayCallback(encapsulated.context)
             val relayBuilder = delegate.newUrlRequestBuilder(
-                config.relayUrl.toString(),
+                config.relayUrl,
                 relayCallback,
-                workExecutor,
+                relayExecutor,
             )
             relayBuilder.setHttpMethod("POST")
             relayBuilder.addHeader("Content-Type", Ohttp.REQUEST_MEDIA_TYPE)
             relayBuilder.addHeader("Accept", Ohttp.RESPONSE_MEDIA_TYPE)
-            relayBuilder.setUploadDataProvider(ByteArrayUploadDataProvider(encapsulated.ciphertext), workExecutor)
+            relayBuilder.setUploadDataProvider(ByteArrayUploadDataProvider(encapsulated.ciphertext), relayExecutor)
             val relay = relayBuilder.build()
 
             synchronized(lock) {
@@ -173,21 +182,23 @@ public class OhttpUrlRequest internal constructor(
         }
     }
 
-    private fun buildOkHttpRequest(body: ByteArray): OkRequest {
-        val builder = OkRequest.Builder().url(targetUrl)
-        var contentType: String? = null
-        for ((name, value) in requestHeaders) {
-            if (name.equals("Content-Type", ignoreCase = true)) contentType = value
-            builder.addHeader(name, value)
-        }
-        val requestBody = when {
-            body.isNotEmpty() -> body.toRequestBody(contentType?.toMediaTypeOrNull())
-            httpMethod !in setOf("GET", "HEAD", "DELETE") -> body.toRequestBody(contentType?.toMediaTypeOrNull())
-            else -> null
-        }
-        builder.method(httpMethod, requestBody)
-        return builder.build()
+    private fun buildBhttpRequest(body: ByteArray): BhttpRequest {
+        val uri = URI(targetUrl)
+        val scheme = uri.scheme ?: throw IllegalArgumentException("targetUrl has no scheme: $targetUrl")
+        val host = uri.host ?: throw IllegalArgumentException("targetUrl has no host: $targetUrl")
+        val authority = buildAuthority(scheme, host, uri.port)
+        val rawPath = uri.rawPath.ifNullOrEmpty("/")
+        val pathWithQuery = if (uri.rawQuery.isNullOrEmpty()) rawPath else "$rawPath?${uri.rawQuery}"
+        return BhttpRequest(httpMethod, scheme, authority, pathWithQuery, requestHeaders, body)
     }
+
+    private fun buildAuthority(scheme: String, host: String, port: Int): String {
+        val defaultPort = (scheme == "https" && (port == -1 || port == 443)) ||
+            (scheme == "http" && (port == -1 || port == 80))
+        return if (defaultPort) host else "$host:$port"
+    }
+
+    private fun String?.ifNullOrEmpty(default: String): String = if (this.isNullOrEmpty()) default else this
 
     private fun deliverFailure(cause: Throwable) {
         val toCancel: UrlRequest?
@@ -198,8 +209,6 @@ public class OhttpUrlRequest internal constructor(
             } else {
                 state = State.FAILED
                 true
-            }.also {
-                // Mutate after computing return so we can return from inside the let chain.
             }
         }
         synchronized(lock) {
@@ -213,13 +222,6 @@ public class OhttpUrlRequest internal constructor(
     }
 
     private fun isCanceled(): Boolean = synchronized(lock) { state == State.CANCELED }
-
-    private data class ReadOutcome(
-        val body: ByteArray,
-        val offset: Int,
-        val info: SynthesizedUrlResponseInfo,
-        val isLast: Boolean,
-    )
 
     /** Internal callback driven by the delegate Cronet engine for the relay leg. */
     private inner class RelayCallback(
@@ -265,13 +267,11 @@ public class OhttpUrlRequest internal constructor(
             try {
                 val encResponse = sink.toByteArray()
                 val bhttpBytes = Ohttp.decapsulateResponse(clientContext, encResponse)
-                val placeholderRequest = OkRequest.Builder().url(targetUrl).build()
-                val okResponse = Bhttp.decodeResponse(placeholderRequest, bhttpBytes)
-                val synthInfo = SynthesizedUrlResponseInfo.fromOkHttpResponse(targetUrl, okResponse)
-                val body = okResponse.body?.bytes() ?: ByteArray(0)
+                val bhttpResp = Bhttp.decodeResponse(bhttpBytes)
+                val synthInfo = SynthesizedUrlResponseInfo.fromBhttpResponse(targetUrl, bhttpResp)
                 val shouldFire = synchronized(lock) {
                     if (state == State.CANCELED || state == State.FAILED) false
-                    else { state = State.DELIVERING; responseBody = body; responseInfo = synthInfo; true }
+                    else { state = State.DELIVERING; responseBody = bhttpResp.body; responseInfo = synthInfo; true }
                 }
                 if (!shouldFire) return
                 userExecutor.execute { userCallback.onResponseStarted(this@OhttpUrlRequest, synthInfo) }
