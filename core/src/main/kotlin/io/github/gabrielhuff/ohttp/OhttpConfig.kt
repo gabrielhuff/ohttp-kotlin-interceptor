@@ -1,11 +1,13 @@
 package io.github.gabrielhuff.ohttp
 
-import okhttp3.HttpUrl
-
 /**
  * Per-target configuration. Wraps the relay URL the encapsulated request
  * should be POSTed to, plus the gateway's published OHTTP key configuration
  * (RFC 9458 §3.1) used to encrypt to that gateway.
+ *
+ * The relay URL is stored as a plain string — every higher-level wrapper
+ * (`OhttpInterceptor`, `OhttpCronetEngine`, etc.) already has its own URL
+ * type and we don't want to drag OkHttp into core.
  *
  * Pass [keyConfigBytes] exactly as fetched from the source (e.g. Fastly's
  * `/.well-known/ohttp-gateway`); the byte format is stable and survives key
@@ -13,7 +15,7 @@ import okhttp3.HttpUrl
  * configuration.
  */
 public class OhttpConfig(
-    public val relayUrl: HttpUrl,
+    public val relayUrl: String,
     public val keyConfigBytes: ByteArray,
 ) {
     internal val keyConfig: KeyConfig = KeyConfig.parse(keyConfigBytes)

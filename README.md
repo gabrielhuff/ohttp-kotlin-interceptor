@@ -11,10 +11,12 @@ Google Tink (`com.google.crypto.tink:tink:1.21.0`).
 
 ## Modules
 
-| Module       | Artifact                  | Purpose                                                                   |
-|--------------|---------------------------|---------------------------------------------------------------------------|
-| `interceptor` | `ohttp-kotlin-interceptor` | The `OhttpInterceptor` and its supporting BHTTP (RFC 9292) + HPKE crypto. |
-| `testing`     | `ohttp-kotlin-testing`    | `InProcessRelay` (fake Fastly) and `InProcessGateway` for integration tests. |
+| Module        | Artifact                   | Purpose                                                                                                                                                                                                                  |
+|---------------|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `core`        | `ohttp-kotlin-core`        | HTTP-stack-agnostic implementation: BHTTP (RFC 9292), HPKE Base + Export on Tink primitives, OHTTP encapsulation (RFC 9458), `KeyConfig`, `OhttpConfig`. Depends only on Tink + Okio. No OkHttp.                          |
+| `interceptor` | `ohttp-kotlin-interceptor` | `OhttpInterceptor` for OkHttp, plus the small `OkHttpBhttpAdapter` that translates between OkHttp `Request`/`Response` and `:core`'s neutral BHTTP types.                                                                  |
+| `testing`     | `ohttp-kotlin-testing`     | `InProcessRelay` (fake Fastly) and `InProcessGateway` for integration tests.                                                                                                                                              |
+| `cronet`      | `ohttp-kotlin-cronet`      | `OhttpCronetEngine` / `OhttpUrlRequest` — Cronet-native wrapper that talks straight to `:core` (no OkHttp on the runtime classpath). Cronet API is compileOnly; consumers add `org.chromium.net:cronet-api` from Google Maven. |
 
 ## Usage
 
@@ -30,7 +32,7 @@ val client = OkHttpClient.Builder()
         OhttpInterceptor(
             mapOf(
                 "api.example.com" to OhttpConfig(
-                    relayUrl = "https://relay.fastly-edge.example/ohttp".toHttpUrl(),
+                    relayUrl = "https://relay.fastly-edge.example/ohttp",
                     keyConfigBytes = keyConfigBytes,
                 ),
             )
@@ -95,7 +97,7 @@ val gateway = InProcessGateway(hostRewriter = { it.newBuilder().host(origin.host
 val relay = InProcessRelay(gatewayUrl = gateway.url)
 
 val client = OkHttpClient.Builder()
-    .addInterceptor(OhttpInterceptor(mapOf("api.example.com" to OhttpConfig(relay.url, gateway.keyConfigBytes))))
+    .addInterceptor(OhttpInterceptor(mapOf("api.example.com" to OhttpConfig(relay.url.toString(), gateway.keyConfigBytes))))
     .build()
 ```
 
@@ -127,3 +129,54 @@ Run everything with:
 ```
 gradle test
 ```
+
+## Cronet integration
+
+The `cronet` module wraps a `CronetEngine`. Build a Cronet `UrlRequest` via
+`OhttpCronetEngine` instead of the engine directly:
+
+```kotlin
+val ohttpEngine = OhttpCronetEngine(
+    delegate = realCronetEngine,
+    configs = mapOf("api.example.com" to OhttpConfig(relayUrl, keyConfigBytes)),
+)
+
+val request = ohttpEngine.newUrlRequestBuilder(
+    "https://api.example.com/v1/things",
+    callback,
+    callbackExecutor,
+)
+    .setHttpMethod("POST")
+    .addHeader("Content-Type", "application/json")
+    .setUploadDataProvider(uploadProvider, uploadExecutor)
+    .build()
+
+request.start()
+```
+
+Requests to hosts not in the map fall through to the wrapped `CronetEngine`
+verbatim. The relay leg also goes via the wrapped engine, so HTTP/3 and
+connection migration apply to client→relay traffic.
+
+The module depends on Cronet at **compile time only**. Add the real artifact
+in your app's build:
+
+```kotlin
+implementation("org.chromium.net:cronet-api:119.6045.31")
+// And one of the Cronet implementations: cronet-embedded (full),
+// Google Play Services provider, or HttpEngine.
+```
+
+(Cronet artifacts are hosted on `https://maven.google.com/`; add that repo to
+your build if it isn't already.)
+
+### Known limitations vs. native Cronet
+
+- **One-shot.** OHTTP doesn't stream, so request/response bodies are buffered
+  end to end. Don't use this path for large uploads/downloads if memory is
+  tight.
+- **No transparent redirect following.** `UrlRequest.followRedirect()` throws.
+  3xx responses are surfaced as the final response; follow them yourself if
+  needed.
+- **`getStatus`** returns a coarse-grained status (engine internals aren't
+  visible to the wrapper).

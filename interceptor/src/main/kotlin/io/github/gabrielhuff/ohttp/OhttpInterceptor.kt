@@ -2,6 +2,7 @@ package io.github.gabrielhuff.ohttp
 
 import io.github.gabrielhuff.ohttp.internal.Bhttp
 import io.github.gabrielhuff.ohttp.internal.Ohttp
+import io.github.gabrielhuff.ohttp.okhttp.OkHttpBhttpAdapter
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -16,26 +17,16 @@ import java.io.IOException
  * not in [configs] are passed through unchanged.
  *
  * For each match, the interceptor:
- *  1. Serializes the [Request] as a binary HTTP message (RFC 9292).
- *  2. Encapsulates it with HPKE using the gateway's public key.
+ *  1. Translates the [Request] to a neutral BHTTP message (`:core`'s
+ *     [io.github.gabrielhuff.ohttp.internal.BhttpRequest]) and serializes it
+ *     per RFC 9292.
+ *  2. Encapsulates the BHTTP bytes with HPKE using the gateway's public key.
  *  3. POSTs the encapsulated payload to the relay URL configured for that host.
  *  4. Decapsulates the response and reconstructs an OkHttp [Response].
  *
- * ### Wiring
  * Register it as an **application** interceptor so the original [Request]'s
  * URL host is observable. Do not register the same interceptor on the client
  * passed as [relayClient], or the relay request would be re-intercepted.
- *
- * ### Removing the interceptor
- * Removing this interceptor (or replacing it with one whose [configs] map is
- * empty) makes every call go out as a normal HTTP request — the rest of the
- * stack is untouched.
- *
- * @param configs map from target hostname (exact match against
- *   [okhttp3.HttpUrl.host]) to the relay+key configuration to use.
- * @param relayClient client used to talk to the relay. Defaults to a fresh
- *   [OkHttpClient]; provide your own if you need custom timeouts, proxy,
- *   connection pool, etc. Must not include this interceptor.
  */
 public class OhttpInterceptor @JvmOverloads constructor(
     configs: Map<String, OhttpConfig>,
@@ -48,8 +39,9 @@ public class OhttpInterceptor @JvmOverloads constructor(
         val original = chain.request()
         val config = configs[original.url.host] ?: return chain.proceed(original)
 
-        val bhttpRequest = Bhttp.encodeRequest(original)
-        val encapsulated = Ohttp.encapsulateRequest(config.keyConfig, bhttpRequest)
+        val bhttpRequest = OkHttpBhttpAdapter.toBhttp(original)
+        val bhttpBytes = Bhttp.encodeRequest(bhttpRequest)
+        val encapsulated = Ohttp.encapsulateRequest(config.keyConfig, bhttpBytes)
 
         val relayRequest = Request.Builder()
             .url(config.relayUrl)
@@ -74,7 +66,8 @@ public class OhttpInterceptor @JvmOverloads constructor(
             } catch (e: Exception) {
                 throw IOException("failed to decapsulate OHTTP response", e)
             }
-            return Bhttp.decodeResponse(original, bhttpResponseBytes)
+            val decoded = Bhttp.decodeResponse(bhttpResponseBytes)
+            return OkHttpBhttpAdapter.fromBhttp(original, decoded)
         }
     }
 

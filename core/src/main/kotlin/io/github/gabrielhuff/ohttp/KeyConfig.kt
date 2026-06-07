@@ -2,8 +2,10 @@ package io.github.gabrielhuff.ohttp
 
 import com.google.crypto.tink.hybrid.internal.HpkeUtil
 import io.github.gabrielhuff.ohttp.internal.HpkeSuite
-import okio.Buffer
-import okio.ByteString.Companion.toByteString
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.nio.ByteBuffer
+import java.util.HexFormat
 
 /**
  * Parsed OHTTP key configuration as defined in RFC 9458 §3.1.
@@ -50,32 +52,33 @@ public class KeyConfig internal constructor(
 
         @JvmStatic
         public fun parse(bytes: ByteArray): KeyConfig {
-            val src = Buffer().write(bytes)
-            val keyId = src.readByte().toInt() and 0xFF
-            val kemId = src.readShort().toInt() and 0xFFFF
+            val src = ByteBuffer.wrap(bytes)
+            val keyId = src.get().toInt() and 0xFF
+            val kemId = src.short.toInt() and 0xFFFF
             val npk = publicKeySizeForKem(kemId)
-            require(src.size >= npk) { "key config truncated: missing public key" }
-            val publicKey = src.readByteArray(npk.toLong())
-            val symLen = src.readShort().toInt() and 0xFFFF
+            require(src.remaining() >= npk) { "key config truncated: missing public key" }
+            val publicKey = ByteArray(npk)
+            src.get(publicKey)
+            require(src.remaining() >= 2) { "key config truncated: missing symmetric algorithms length" }
+            val symLen = src.short.toInt() and 0xFFFF
             require(symLen % 4 == 0) { "symmetric algorithms section must be a multiple of 4 bytes" }
-            require(src.size >= symLen) { "key config truncated: missing symmetric algorithms" }
-            val symBytes = src.readByteArray(symLen.toLong())
-            val syms = Buffer().write(symBytes).let { buf ->
-                buildList {
-                    while (!buf.exhausted()) {
-                        val kdf = buf.readShort().toInt() and 0xFFFF
-                        val aead = buf.readShort().toInt() and 0xFFFF
-                        add(SymmetricAlgorithmPair(kdf, aead))
-                    }
+            require(src.remaining() >= symLen) { "key config truncated: missing symmetric algorithms" }
+            val syms = buildList {
+                val end = src.position() + symLen
+                while (src.position() < end) {
+                    val kdf = src.short.toInt() and 0xFFFF
+                    val aead = src.short.toInt() and 0xFFFF
+                    add(SymmetricAlgorithmPair(kdf, aead))
                 }
             }
-            require(src.exhausted()) { "trailing bytes in key config" }
+            require(!src.hasRemaining()) { "trailing bytes in key config" }
             return KeyConfig(keyId, kemId, publicKey, syms)
         }
 
         @JvmStatic
         public fun serialize(config: KeyConfig): ByteArray {
-            val out = Buffer()
+            val baos = ByteArrayOutputStream(8 + config.publicKey.size + config.symmetricAlgorithms.size * 4)
+            val out = DataOutputStream(baos)
             out.writeByte(config.keyId)
             out.writeShort(config.kemId)
             out.write(config.publicKey)
@@ -84,7 +87,7 @@ public class KeyConfig internal constructor(
                 out.writeShort(pair.kdfId)
                 out.writeShort(pair.aeadId)
             }
-            return out.readByteArray()
+            return baos.toByteArray()
         }
 
         // RFC 9180 §7.1 — Npk for each KEM.
@@ -102,6 +105,6 @@ public class KeyConfig internal constructor(
     }
 
     override fun toString(): String =
-        "KeyConfig(keyId=$keyId, kemId=0x${"%04x".format(kemId)}, pk=${publicKey.toByteString().hex()}, " +
+        "KeyConfig(keyId=$keyId, kemId=0x${"%04x".format(kemId)}, pk=${HexFormat.of().formatHex(publicKey)}, " +
             "symmetric=$symmetricAlgorithms)"
 }

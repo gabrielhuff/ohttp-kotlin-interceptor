@@ -1,9 +1,9 @@
 package io.github.gabrielhuff.ohttp
 
-import okio.ByteString.Companion.decodeHex
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
+import java.util.HexFormat
 
 class KeyConfigTest {
 
@@ -19,7 +19,7 @@ class KeyConfigTest {
             "0004" +                                                       // 4 bytes of symmetric algorithms
             "0001" + "0001"                                                // HKDF-SHA256, AES-128-GCM
         )
-        val bytes = hex.decodeHex().toByteArray()
+        val bytes = HexFormat.of().parseHex(hex)
         val cfg = KeyConfig.parse(bytes)
 
         assertEquals(0x01, cfg.keyId)
