@@ -13,26 +13,15 @@ import java.util.concurrent.Executors
  * target hosts. Requests to any host not in [configs] are routed straight
  * through the wrapped engine — that is, the wrapper is a no-op for them.
  *
- * Wiring mirrors [io.github.gabrielhuff.ohttp.OhttpInterceptor] for the OkHttp
- * stack: pass a `Map<hostname, OhttpConfig>`. Each [OhttpConfig] carries the
- * relay URL and the gateway's published OHTTP key configuration bytes.
- *
- * The underlying [delegate] is also used for the relay leg, so any HTTP/3,
- * connection migration, or proxy settings configured on the delegate apply
- * to client→relay traffic too.
- *
  * @param delegate the real Cronet engine that will dispatch network calls.
  * @param configs target host → relay/key configuration.
- * @param workExecutor optional executor used for encapsulation, body
- *   buffering, and internal relay-callback dispatch. Defaults to a small
- *   shared thread pool. **Must not** be the user-facing executor that
- *   consumers pass per-request, to avoid blocking their callbacks during
- *   encapsulation.
+ * @param threading executor wiring for the internal work. See [Threading].
+ *   Defaults route all internal work to a single shared cached thread pool.
  */
 public class OhttpCronetEngine @JvmOverloads constructor(
     private val delegate: CronetEngine,
     configs: Map<String, OhttpConfig>,
-    private val workExecutor: Executor = defaultWorkExecutor(),
+    private val threading: Threading = Threading.shared(),
 ) {
     private val configs: Map<String, OhttpConfig> = configs.toMap()
 
@@ -53,13 +42,61 @@ public class OhttpCronetEngine @JvmOverloads constructor(
         return if (config == null) {
             delegate.newUrlRequestBuilder(url, callback, executor)
         } else {
-            OhttpUrlRequest.Builder(delegate, url, callback, executor, workExecutor, config)
+            OhttpUrlRequest.Builder(delegate, url, callback, executor, threading, config)
         }
     }
 
-    public companion object {
-        private fun defaultWorkExecutor(): Executor = Executors.newCachedThreadPool { r ->
-            Thread(r, "ohttp-cronet-work").apply { isDaemon = true }
+    /**
+     * Executor wiring for the OHTTP pipeline. Lets callers route distinct
+     * pieces of work (HPKE / BHTTP, upload buffering, delegate-callback
+     * dispatch) onto separate pools — useful when you want, for example,
+     * crypto on a CPU-bound pool and I/O-driven callbacks on an event-loop
+     * thread.
+     *
+     * Defaults wire all three to a single shared cached thread pool, which
+     * is fine for most callers.
+     *
+     * ### Constraints
+     * - [relayCallback] **must not** be the same single-threaded executor
+     *   the user passes per-request as `UrlRequest.Callback`'s executor;
+     *   doing so risks deadlock because the relay callback may dispatch
+     *   user callbacks and the per-request executor would then be blocked
+     *   on itself.
+     * - [crypto] may block briefly during HPKE seal/open. Don't share it
+     *   with latency-sensitive work.
+     *
+     * @param crypto runs HPKE encapsulation/decapsulation, BHTTP encode/
+     *   decode, and the overall request orchestration.
+     * @param uploadBuffering drains the user's [org.chromium.net.UploadDataProvider]
+     *   into memory before BHTTP encoding (OHTTP is one-shot).
+     * @param relayCallback executor handed to the delegate [CronetEngine]
+     *   for the inner relay [UrlRequest]'s callbacks. The wrapper wraps
+     *   this in a per-request serial dispatcher; if you pass a multi-threaded
+     *   pool, ordering between `onReadCompleted` and `onSucceeded` is
+     *   preserved per-request.
+     */
+    public class Threading(
+        public val crypto: Executor,
+        public val uploadBuffering: Executor,
+        public val relayCallback: Executor,
+    ) {
+        public companion object {
+            /** All three knobs share a single cached thread pool. The default. */
+            @JvmStatic
+            public fun shared(executor: Executor = defaultCachedPool()): Threading =
+                Threading(crypto = executor, uploadBuffering = executor, relayCallback = executor)
+
+            /** Distinct executors per role; the caller owns lifecycle. */
+            @JvmStatic
+            public fun split(
+                crypto: Executor,
+                uploadBuffering: Executor,
+                relayCallback: Executor,
+            ): Threading = Threading(crypto, uploadBuffering, relayCallback)
+
+            private fun defaultCachedPool(): Executor = Executors.newCachedThreadPool { r ->
+                Thread(r, "ohttp-cronet-work").apply { isDaemon = true }
+            }
         }
     }
 }

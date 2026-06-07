@@ -26,9 +26,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [OhttpCronetEngine.newUrlRequestBuilder].
  *
  * Flow:
- *  1. [start] buffers the user's upload (via [UploadDataProvider]) on
- *     [workExecutor], BHTTP-encodes the request, OHTTP-encapsulates it, and
- *     issues a relay `UrlRequest` through the delegate [CronetEngine].
+ *  1. [start] buffers the user's upload (via [UploadDataProvider]) on the
+ *     configured [OhttpCronetEngine.Threading] executors, BHTTP-encodes the
+ *     request, OHTTP-encapsulates it, and issues a relay `UrlRequest` through
+ *     the delegate [CronetEngine].
  *  2. The relay response is buffered, decapsulated, decoded back to a
  *     [io.github.gabrielhuff.ohttp.internal.BhttpResponse], and surfaced to
  *     the user via the standard `onResponseStarted` / `onReadCompleted` /
@@ -47,7 +48,7 @@ public class OhttpUrlRequest internal constructor(
     private val targetUrl: String,
     private val userCallback: UrlRequest.Callback,
     private val userExecutor: Executor,
-    private val workExecutor: Executor,
+    private val threading: OhttpCronetEngine.Threading,
     private val config: OhttpConfig,
     private val httpMethod: String,
     private val requestHeaders: List<Pair<String, String>>,
@@ -69,7 +70,7 @@ public class OhttpUrlRequest internal constructor(
             check(state == State.INIT) { "start() already called (state=$state)" }
             state = State.STARTED
         }
-        workExecutor.execute { encapsulateAndDispatch() }
+        threading.crypto.execute { encapsulateAndDispatch() }
     }
 
     public override fun cancel() {
@@ -144,7 +145,7 @@ public class OhttpUrlRequest internal constructor(
             if (isCanceled()) return
 
             val bodyBytes = uploadDataProvider
-                ?.let { UploadBuffering.bufferAll(it, uploadDataExecutor!!) }
+                ?.let { UploadBuffering.bufferAll(it, uploadDataExecutor ?: threading.uploadBuffering) }
                 ?: ByteArray(0)
             if (isCanceled()) return
 
@@ -152,10 +153,12 @@ public class OhttpUrlRequest internal constructor(
             val bhttpBytes = Bhttp.encodeRequest(bhttpReq)
             val encapsulated = Ohttp.encapsulateRequest(config.keyConfig, bhttpBytes)
 
-            // Per-request serial executor: the underlying workExecutor may be a
-            // thread pool, but the relay UrlRequest's onReadCompleted /
-            // onSucceeded callbacks share a buffer and MUST run sequentially.
-            val relayExecutor = SerialExecutor(workExecutor)
+            // Per-request serial executor over the configured relay-callback
+            // executor: the delegate's onReadCompleted/onSucceeded share a
+            // buffer and MUST run sequentially. The serialization is
+            // per-request, so cross-request work still parallelizes on the
+            // underlying executor.
+            val relayExecutor = SerialExecutor(threading.relayCallback)
             val relayCallback = RelayCallback(encapsulated.context)
             val relayBuilder = delegate.newUrlRequestBuilder(
                 config.relayUrl,
@@ -295,7 +298,7 @@ public class OhttpUrlRequest internal constructor(
         private val targetUrl: String,
         private val callback: UrlRequest.Callback,
         private val executor: Executor,
-        private val workExecutor: Executor,
+        private val threading: OhttpCronetEngine.Threading,
         private val config: OhttpConfig,
     ) : UrlRequest.Builder() {
 
@@ -319,7 +322,7 @@ public class OhttpUrlRequest internal constructor(
             targetUrl = targetUrl,
             userCallback = callback,
             userExecutor = executor,
-            workExecutor = workExecutor,
+            threading = threading,
             config = config,
             httpMethod = method,
             requestHeaders = headers.toList(),
