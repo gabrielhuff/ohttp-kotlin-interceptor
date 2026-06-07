@@ -15,7 +15,6 @@ import org.junit.jupiter.api.condition.EnabledIf
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
-import java.util.HexFormat
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -44,7 +43,7 @@ import java.util.concurrent.TimeUnit
 class ReferenceRelayInteropTest {
 
     private lateinit var origin: MockWebServer
-    private lateinit var gatewayProcess: Process
+    private lateinit var gateway: ReferenceGateway
     private lateinit var relayProcess: Process
     private lateinit var gatewayKeyConfigBytes: ByteArray
     private lateinit var relayAddress: String
@@ -53,19 +52,13 @@ class ReferenceRelayInteropTest {
     fun setUp() {
         origin = MockWebServer().apply { start() }
 
-        gatewayProcess = ProcessBuilder(
-            ReferenceGatewayInteropTest.binaryPath().absolutePath,
-            "--addr", "127.0.0.1:0",
-            "--origin", "http://${origin.hostName}:${origin.port}",
-            "--key-id", "1",
-        ).redirectErrorStream(false).start()
-        val gatewayStartup = ReferenceGatewayInteropTest.readGatewayStartup(gatewayProcess)
-        gatewayKeyConfigBytes = HexFormat.of().parseHex(gatewayStartup.keyConfigHex)
+        gateway = ReferenceGateway(originUrl = "http://${origin.hostName}:${origin.port}")
+        gatewayKeyConfigBytes = gateway.keyConfigBytes
 
         val relayBinary = relayBinaryPath()
         relayProcess = ProcessBuilder(
             relayBinary.absolutePath,
-            "--gateway", "http://${gatewayStartup.address}",
+            "--gateway", "http://${gateway.address}",
         ).redirectErrorStream(false).start()
         relayAddress = readRelayStartup(relayProcess)
     }
@@ -74,8 +67,7 @@ class ReferenceRelayInteropTest {
     fun tearDown() {
         relayProcess.destroy()
         if (!relayProcess.waitFor(2, TimeUnit.SECONDS)) relayProcess.destroyForcibly()
-        gatewayProcess.destroy()
-        if (!gatewayProcess.waitFor(2, TimeUnit.SECONDS)) gatewayProcess.destroyForcibly()
+        gateway.close()
         origin.shutdown()
     }
 
@@ -115,7 +107,7 @@ class ReferenceRelayInteropTest {
     companion object {
         @JvmStatic
         fun binariesAvailable(): Boolean =
-            ReferenceGatewayInteropTest.binaryPath().canExecute() && relayBinaryPath().canExecute()
+            ReferenceGateway.isAvailable() && relayBinaryPath().canExecute()
 
         private fun relayBinaryPath(): File {
             val override = System.getenv("OHTTP_REFERENCE_RELAY")

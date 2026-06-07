@@ -14,12 +14,6 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.condition.EnabledIf
-import java.io.BufferedReader
-import java.io.File
-import java.io.InputStreamReader
-import java.util.HexFormat
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
 
 /**
  * Interop test: drives the Kotlin OHTTP client against
@@ -31,37 +25,26 @@ import java.util.concurrent.TimeUnit
  * with `./gradlew :testing:buildReferenceGateway` (or `cargo build --release`
  * directly in `interop/reference-gateway`).
  */
-@EnabledIf("io.github.gabrielhuff.ohttp.testing.ReferenceGatewayInteropTest#binaryAvailable")
+@EnabledIf("io.github.gabrielhuff.ohttp.testing.ReferenceGateway#isAvailable")
 class ReferenceGatewayInteropTest {
 
     private lateinit var origin: MockWebServer
-    private lateinit var gatewayProcess: Process
+    private lateinit var gateway: ReferenceGateway
     private lateinit var gatewayKeyConfigBytes: ByteArray
-    private lateinit var gatewayAddress: String
     private lateinit var relay: InProcessRelay
 
     @BeforeEach
     fun setUp() {
         origin = MockWebServer().apply { start() }
-        gatewayProcess = ProcessBuilder(
-            binaryPath().absolutePath,
-            "--addr", "127.0.0.1:0",
-            "--origin", "http://${origin.hostName}:${origin.port}",
-            "--key-id", "1",
-        ).redirectErrorStream(false).start()
-
-        val (kc, addr) = readGatewayStartup(gatewayProcess)
-        gatewayKeyConfigBytes = HexFormat.of().parseHex(kc)
-        gatewayAddress = addr
-
-        relay = InProcessRelay(gatewayUrl = "http://$gatewayAddress/ohttp".toHttpUrl())
+        gateway = ReferenceGateway(originUrl = "http://${origin.hostName}:${origin.port}")
+        gatewayKeyConfigBytes = gateway.keyConfigBytes
+        relay = InProcessRelay(gatewayUrl = gateway.ohttpUrl.toHttpUrl())
     }
 
     @AfterEach
     fun tearDown() {
         relay.close()
-        gatewayProcess.destroy()
-        if (!gatewayProcess.waitFor(2, TimeUnit.SECONDS)) gatewayProcess.destroyForcibly()
+        gateway.close()
         origin.shutdown()
     }
 
@@ -129,46 +112,5 @@ class ReferenceGatewayInteropTest {
         val originReq = origin.takeRequest()
         assertEquals("POST", originReq.method)
         assertEquals(payload, originReq.body.readUtf8())
-    }
-
-    companion object {
-        @JvmStatic
-        fun binaryAvailable(): Boolean = binaryPath().canExecute()
-
-        internal fun binaryPath(): File {
-            val override = System.getenv("OHTTP_REFERENCE_GATEWAY")
-            if (override != null) return File(override)
-            var dir: File? = File(System.getProperty("user.dir"))
-            while (dir != null && !File(dir, "settings.gradle.kts").exists()) {
-                dir = dir.parentFile
-            }
-            return File(dir, "interop/reference-gateway/target/release/ohttp-reference-gateway")
-        }
-
-        internal data class Startup(val keyConfigHex: String, val address: String)
-
-        internal fun readGatewayStartup(process: Process): Startup {
-            val q = LinkedBlockingQueue<String>()
-            val reader = BufferedReader(InputStreamReader(process.errorStream))
-            Thread({
-                reader.useLines { lines -> lines.forEach { q.put(it) } }
-            }, "ref-gateway-stderr-drain").apply { isDaemon = true }.start()
-
-            var keyConfig: String? = null
-            var address: String? = null
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-            while (System.nanoTime() < deadline && (keyConfig == null || address == null)) {
-                val remaining = deadline - System.nanoTime()
-                val line = q.poll(remaining, TimeUnit.NANOSECONDS) ?: break
-                when {
-                    line.startsWith("keyConfigHex=") -> keyConfig = line.removePrefix("keyConfigHex=").trim()
-                    line.startsWith("listening=") -> address = line.removePrefix("listening=").trim()
-                }
-            }
-            return Startup(
-                keyConfig ?: error("reference gateway did not emit keyConfigHex"),
-                address ?: error("reference gateway did not emit listening address"),
-            )
-        }
     }
 }

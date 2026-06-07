@@ -95,6 +95,13 @@ dependencies {
     testRuntimeOnly(cronetApi)
 }
 
+// The reference-gateway interop test (OhttpCronetReferenceGatewayInteropTest)
+// runs only when the Rust binary is built; reuse :testing's cargo build task so
+// it's present when we run cronet tests (the test skips cleanly without cargo).
+tasks.named("test").configure {
+    dependsOn(":testing:buildReferenceGateway")
+}
+
 // Friend access to :core's internals (BhttpRequest, Bhttp, Ohttp).
 tasks.named("compileKotlin", org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask::class.java).configure {
     val coreJar = core.tasks.named("jar")
