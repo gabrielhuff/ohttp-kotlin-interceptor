@@ -1,13 +1,10 @@
 package io.github.gabrielhuff.ohttp
 
-import io.github.gabrielhuff.ohttp.internal.Bhttp
+import io.github.gabrielhuff.ohttp.internal.KeyConfigManager
 import io.github.gabrielhuff.ohttp.internal.Ohttp
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
 /**
@@ -16,14 +13,14 @@ import okhttp3.Response
  * match [gatewayUrl] are passed through unchanged. To proxy more than one
  * gateway, install one interceptor per gateway.
  *
- * For each matching request, the interceptor:
- *  1. Serializes the [Request] to a BHTTP message (RFC 9292).
- *  2. Encapsulates the BHTTP bytes with HPKE using the gateway's public key.
- *  3. POSTs the encapsulated payload to [relayUrl] via `chain.proceed`, so the
- *     relay leg reuses the same client (connection pool, timeouts, proxy).
- *  4. Decapsulates the response and reconstructs an OkHttp [Response].
+ * For each matching request, the interceptor serializes it to BHTTP (RFC 9292),
+ * encapsulates it with HPKE using the gateway's public key, POSTs the result to
+ * [relayUrl] via `chain.proceed` (so the relay leg reuses the same client), and
+ * decapsulates the response. The BHTTP/HPKE work lives in
+ * [io.github.gabrielhuff.ohttp.internal.Ohttp]; this class is just the chain
+ * wiring and the key-rotation retry.
  *
- * Install it as an **application** interceptor so the original [Request]'s URL
+ * Install it as an **application** interceptor so the original request's URL
  * host is observable. The relay request flows through `chain.proceed`, which
  * descends to later interceptors and the network — it never re-enters this
  * interceptor, so there is no risk of recursively encapsulating it.
@@ -33,8 +30,8 @@ import okhttp3.Response
  * from [gatewayUrl]) using [keyConfigClient], and cached in memory. If
  * [defaultKeyConfigBytes] is supplied and parseable it seeds that cache so the
  * first request needs no round trip. When the gateway rotates keys, the first
- * affected request fails, the interceptor calls [refreshKey], and retries once.
- * Callers may also call [refreshKey] proactively (e.g. on app foreground).
+ * affected request is rejected, the interceptor refreshes the key, and retries
+ * once. Callers may also call [refreshKey] proactively (e.g. on app foreground).
  *
  * @param gatewayUrl identifies which requests to encapsulate (matched by host).
  * @param relayUrl where the encapsulated request is POSTed.
@@ -72,87 +69,23 @@ public class OhttpInterceptor @JvmOverloads constructor(
         val original = chain.request()
         if (original.url.host != gatewayUrl.host) return chain.proceed(original)
 
-        val bhttpBytes = try {
-            Bhttp.encodeRequest(original)
-        } catch (e: Exception) {
-            throw OhttpRequestEncodingException("failed to encode request as BHTTP", e)
-        }
-
-        var refreshed = false
-        while (true) {
-            val keyConfig = keys.get()
-            val encapsulated = try {
-                Ohttp.encapsulateRequest(keyConfig, bhttpBytes)
-            } catch (e: Exception) {
-                throw OhttpRequestEncodingException("failed to encapsulate request for gateway $gatewayUrl", e)
-            }
-
-            val relayRequest = Request.Builder()
-                .url(relayUrl)
-                .post(encapsulated.ciphertext.toRequestBody(REQUEST_CONTENT_TYPE))
-                .header("Accept", Ohttp.RESPONSE_MEDIA_TYPE)
-                .build()
-
-            val relayResponse = chain.proceed(relayRequest)
-
-            // A successful, correctly-typed response is the only thing we decode.
-            // Origin-level errors (404, 500, …) arrive *inside* a valid ohttp-res
-            // and flow through here normally — they are not relay/key failures.
-            if (relayResponse.isSuccessful && isOhttpResponse(relayResponse)) {
-                return relayResponse.use { decodeOhttpResponse(it, encapsulated.context, original) }
-            }
-
-            val code = relayResponse.code
-            // A 4xx from the relay/gateway is read as a probable key rejection
-            // (the gateway couldn't decapsulate). Anything else — 5xx, a wrong
-            // content type, an empty body — is an unexpected transport response
-            // that a key refresh would not fix.
-            val likelyKeyRejection = !relayResponse.isSuccessful && code in 400..499
-            relayResponse.close()
-
-            if (likelyKeyRejection && !refreshed) {
-                refreshed = true
-                keys.refresh()
-                continue
-            }
-            throw if (likelyKeyRejection) {
-                OhttpKeyMismatchException(
-                    "gateway $gatewayUrl rejected the encapsulated request (HTTP $code) even after a key refresh",
-                    code,
-                )
-            } else {
-                OhttpUnexpectedResponseException("OHTTP relay returned an unexpected response (HTTP $code)", code)
-            }
-        }
-    }
-
-    private fun decodeOhttpResponse(
-        relayResponse: Response,
-        context: Ohttp.ClientContext,
-        original: Request,
-    ): Response {
-        val encapsulatedResponse = relayResponse.body?.bytes()
-            ?: throw OhttpUnexpectedResponseException("OHTTP relay returned an empty body", relayResponse.code)
-        val bhttpResponseBytes = try {
-            Ohttp.decapsulateResponse(context, encapsulatedResponse)
-        } catch (e: Exception) {
-            throw OhttpDecapsulationException("failed to decapsulate OHTTP response", e)
-        }
         return try {
-            Bhttp.decodeResponse(bhttpResponseBytes, original)
-        } catch (e: Exception) {
-            throw OhttpDecapsulationException("failed to decode BHTTP response", e)
+            interceptOhttp(chain)
+        } catch (e: OhttpKeyMismatchException) {
+            // The key was outdated/unregistered: refresh and retry exactly once.
+            // A second mismatch propagates as the terminal failure.
+            keys.refresh()
+            interceptOhttp(chain)
         }
     }
 
-    private fun isOhttpResponse(response: Response): Boolean {
-        val contentType = response.body?.contentType()?.toString() ?: return false
-        return contentType.startsWith(Ohttp.RESPONSE_MEDIA_TYPE)
+    private fun interceptOhttp(chain: Interceptor.Chain): Response {
+        val original = chain.request()
+        val (relayRequest, context) = Ohttp.encapsulateRequest(original, keys.get(), relayUrl)
+        return Ohttp.decapsulateResponse(chain.proceed(relayRequest), context, original)
     }
 
     private companion object {
-        val REQUEST_CONTENT_TYPE = Ohttp.REQUEST_MEDIA_TYPE.toMediaType()
-
         // RFC 9540 §4.1 — the gateway publishes its key configuration at the
         // well-known URI on its own origin.
         fun wellKnownKeyConfigUrl(gatewayUrl: HttpUrl): HttpUrl =

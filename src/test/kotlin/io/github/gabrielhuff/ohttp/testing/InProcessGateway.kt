@@ -1,10 +1,13 @@
 package io.github.gabrielhuff.ohttp.testing
 
-import io.github.gabrielhuff.ohttp.internal.Bhttp
 import io.github.gabrielhuff.ohttp.internal.HpkeSuite
 import io.github.gabrielhuff.ohttp.internal.Ohttp
 import okhttp3.HttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -15,30 +18,31 @@ import java.io.Closeable
  * In-process OHTTP gateway, used as the upstream for [InProcessRelay] in
  * end-to-end tests. Generates an HPKE keypair on construction (via
  * BouncyCastle), exposes the corresponding key configuration via
- * [keyConfigBytes], decapsulates incoming OHTTP requests, dispatches the
- * decoded HTTP request through [originClient], and re-wraps the response.
+ * [keyConfigBytes] (served to clients by [InProcessKeyDistributor]),
+ * decapsulates incoming OHTTP requests, dispatches the decoded HTTP request
+ * through [originClient], and re-wraps the response.
  *
- * It also publishes its current key configuration over HTTP at
- * [keyConfigUrl] (`application/ohttp-keys`), so the interceptor's key-fetch
- * path can be exercised. [rotateKey] generates a fresh keypair, which makes
- * any request encapsulated against the old config fail to decapsulate — the
- * mechanism used to test rotation/refresh.
+ * It mirrors the client exactly through the symmetric [Ohttp] methods, bridging
+ * MockWebServer's [RecordedRequest]/[MockResponse] to OkHttp `Request`/`Response`
+ * with two small adapters.
  *
  * Defaults to the Fastly/Cloudflare baseline suite
  * (X25519 + HKDF-SHA256 + AES-128-GCM).
  *
- * If [hostRewriter] is set, the decoded request URL is rewritten before
- * dispatch. Useful when the encapsulated request is addressed to e.g.
+ * If [originUrl] is set, the decoded request's scheme/host/port are rewritten to
+ * it before dispatch. Useful when the encapsulated request is addressed to e.g.
  * `api.example.com` but the test wants it served by a local MockWebServer.
+ * [rotateKey] generates a fresh keypair, making any request encapsulated against
+ * the previously published config fail to decapsulate — the rotation mechanism.
  */
 internal class InProcessGateway(
     val keyId: Int = 0x01,
     private val kemId: Int = 0x0020,
     private val kdfId: Int = 0x0001,
     private val aeadId: Int = 0x0001,
+    private val originUrl: HttpUrl? = null,
     private val originClient: OkHttpClient = OkHttpClient(),
     private val server: MockWebServer = MockWebServer(),
-    private val hostRewriter: ((HttpUrl) -> HttpUrl)? = null,
 ) : Closeable {
 
     private val suite = HpkeSuite(kemId.toShort(), kdfId.toShort(), aeadId.toShort())
@@ -87,56 +91,55 @@ internal class InProcessGateway(
     val url: HttpUrl
         get() = server.url("/ohttp")
 
-    /** Where the current key configuration is published (RFC 9540 §4.1 media type). */
-    val keyConfigUrl: HttpUrl
-        get() = server.url("/.well-known/ohttp-gateway")
-
     override fun close() {
         server.shutdown()
     }
 
-    private fun handle(request: RecordedRequest): MockResponse {
-        if (request.method == "GET" && request.path == "/.well-known/ohttp-gateway") {
-            return MockResponse()
-                .setResponseCode(200)
-                .setHeader("Content-Type", "application/ohttp-keys")
-                .setBody(okio.Buffer().write(state.keyConfigBytes))
-        }
-        if (request.method != "POST" || request.path != "/ohttp") {
+    private fun handle(recorded: RecordedRequest): MockResponse {
+        if (recorded.method != "POST" || recorded.path != "/ohttp") {
             return MockResponse().setResponseCode(404)
         }
-        val contentType = request.getHeader("Content-Type")
+        val contentType = recorded.getHeader("Content-Type")
         if (contentType == null || !contentType.startsWith(Ohttp.REQUEST_MEDIA_TYPE)) {
             return MockResponse().setResponseCode(415)
         }
 
-        val encReq = request.body.readByteArray()
-        val decReq = try {
-            Ohttp.decapsulateRequest(state.gatewayKey, encReq)
+        val decapsulated = try {
+            Ohttp.decapsulateRequest(recorded.toOkHttpRequest(), state.gatewayKey)
         } catch (t: Throwable) {
             return MockResponse().setResponseCode(400).setBody("decapsulation failed: ${t.message}")
         }
-        val decodedRequest = try {
-            Bhttp.decodeRequest(decReq.plaintext)
-        } catch (t: Throwable) {
-            return MockResponse().setResponseCode(400).setBody("BHTTP decode failed: ${t.message}")
+
+        val inner = decapsulated.request.let { req ->
+            originUrl?.let { origin ->
+                req.newBuilder()
+                    .url(req.url.newBuilder().scheme(origin.scheme).host(origin.host).port(origin.port).build())
+                    .build()
+            } ?: req
         }
 
-        val dispatched = hostRewriter?.let { rewriter ->
-            decodedRequest.newBuilder().url(rewriter(decodedRequest.url)).build()
-        } ?: decodedRequest
-
-        val upstream = try {
-            originClient.newCall(dispatched).execute()
+        val outer = try {
+            originClient.newCall(inner).execute().use { upstream ->
+                Ohttp.encapsulateResponse(upstream, decapsulated.context)
+            }
         } catch (t: Throwable) {
             return MockResponse().setResponseCode(502).setBody("origin fetch failed: ${t.message}")
         }
 
-        val bhttpRespBytes = upstream.use { Bhttp.encodeResponse(it) }
-        val encResp = Ohttp.encapsulateResponse(decReq.context, bhttpRespBytes)
-        return MockResponse()
-            .setResponseCode(200)
-            .setHeader("Content-Type", Ohttp.RESPONSE_MEDIA_TYPE)
-            .setBody(okio.Buffer().write(encResp))
+        return outer.toMockResponse()
     }
+
+    /** Wraps the received POST body as an OkHttp [Request] so [Ohttp.decapsulateRequest] can read it. */
+    private fun RecordedRequest.toOkHttpRequest(): Request =
+        Request.Builder()
+            .url(url)
+            .post(body.readByteArray().toRequestBody(Ohttp.REQUEST_MEDIA_TYPE.toMediaType()))
+            .build()
+
+    /** Unwraps the encapsulated [Response] back into a MockWebServer [MockResponse]. */
+    private fun Response.toMockResponse(): MockResponse =
+        MockResponse()
+            .setResponseCode(code)
+            .setHeader("Content-Type", body?.contentType()?.toString() ?: Ohttp.RESPONSE_MEDIA_TYPE)
+            .setBody(okio.Buffer().write(body?.bytes() ?: ByteArray(0)))
 }

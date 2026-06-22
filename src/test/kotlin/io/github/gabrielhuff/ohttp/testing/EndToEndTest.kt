@@ -21,30 +21,19 @@ import org.junit.jupiter.api.Test
 class EndToEndTest {
 
     private lateinit var origin: MockWebServer
-    private lateinit var gateway: InProcessGateway
-    private lateinit var relay: InProcessRelay
+    private lateinit var infra: InProcessOhttpInfra
 
     @BeforeEach
     fun setUp() {
+        // The intercepted request is addressed to api.example.com (the public
+        // target), but in tests the gateway redirects it to the local origin.
         origin = MockWebServer().apply { start() }
-        gateway = InProcessGateway(
-            // The intercepted request is addressed to api.example.com (the public
-            // target), but in tests we redirect it to the local origin server.
-            hostRewriter = { url ->
-                url.newBuilder()
-                    .host(origin.hostName)
-                    .port(origin.port)
-                    .scheme("http")
-                    .build()
-            }
-        )
-        relay = InProcessRelay(gatewayUrl = gateway.url)
+        infra = InProcessOhttpInfra(originUrl = origin.url("/"))
     }
 
     @AfterEach
     fun tearDown() {
-        relay.close()
-        gateway.close()
+        infra.close()
         origin.shutdown()
     }
 
@@ -59,8 +48,8 @@ class EndToEndTest {
     private fun makeInterceptor(): OhttpInterceptor =
         OhttpInterceptor(
             gatewayUrl = gatewayUrl,
-            relayUrl = relay.url,
-            defaultKeyConfigBytes = gateway.keyConfigBytes,
+            relayUrl = infra.relay.url,
+            defaultKeyConfigBytes = infra.gateway.keyConfigBytes,
         )
 
     @Test
@@ -90,7 +79,7 @@ class EndToEndTest {
         assertEquals("ohttp-test", originReq.getHeader("X-App"))
 
         // The relay only ever saw opaque encapsulated bytes.
-        val seen = relay.lastForwardedRequestBytes()
+        val seen = infra.relay.lastForwardedRequestBytes()
         assertNotNull(seen)
         assertFalse(seen!!.decodeToString().contains("X-App"))
         assertFalse(seen.decodeToString().contains("v1/status"))
@@ -145,13 +134,13 @@ class EndToEndTest {
     fun `key config is fetched on first use when no default is provided`() {
         origin.enqueue(MockResponse().setResponseCode(200).setBody("fetched"))
 
-        // No seed: the interceptor must pull the key from the gateway's
+        // No seed: the interceptor must pull the key from the distributor's
         // published well-known endpoint before it can encapsulate.
         val client = makeClient(
             OhttpInterceptor(
                 gatewayUrl = gatewayUrl,
-                relayUrl = relay.url,
-                keyConfigUrl = gateway.keyConfigUrl,
+                relayUrl = infra.relay.url,
+                keyConfigUrl = infra.keyDistributor.keyConfigUrl,
             )
         )
 
@@ -173,9 +162,9 @@ class EndToEndTest {
         val client = makeClient(
             OhttpInterceptor(
                 gatewayUrl = gatewayUrl,
-                relayUrl = relay.url,
-                keyConfigUrl = gateway.keyConfigUrl,
-                defaultKeyConfigBytes = gateway.keyConfigBytes,
+                relayUrl = infra.relay.url,
+                keyConfigUrl = infra.keyDistributor.keyConfigUrl,
+                defaultKeyConfigBytes = infra.gateway.keyConfigBytes,
             )
         )
 
@@ -185,7 +174,7 @@ class EndToEndTest {
         assertEquals("before", first.body!!.string())
 
         // Gateway rotates: the seeded key is now stale and will be rejected.
-        gateway.rotateKey()
+        infra.gateway.rotateKey()
 
         val second = client.newCall(
             Request.Builder().url("https://api.example.com/v1/status").build()
@@ -196,17 +185,19 @@ class EndToEndTest {
 
     @Test
     fun `a key the gateway never accepts surfaces as OhttpKeyMismatchException`() {
-        // A second gateway with an unrelated keypair. We feed its key (both as
-        // seed and via its key URL) to the interceptor, but route traffic through
-        // the *real* gateway — which can never decapsulate it, even after refresh.
-        val wrongGateway = InProcessGateway()
+        // An unrelated keypair's config, published by its own distributor. We feed
+        // it to the interceptor (as seed and via its key URL) but route traffic
+        // through the real gateway, which can never decapsulate it — even after
+        // the refresh re-fetches the same wrong key.
+        val wrongKeyConfigBytes = InProcessGateway().use { it.keyConfigBytes }
+        val wrongDistributor = InProcessKeyDistributor(keyConfigBytes = { wrongKeyConfigBytes })
         try {
             val client = makeClient(
                 OhttpInterceptor(
                     gatewayUrl = gatewayUrl,
-                    relayUrl = relay.url,
-                    keyConfigUrl = wrongGateway.keyConfigUrl,
-                    defaultKeyConfigBytes = wrongGateway.keyConfigBytes,
+                    relayUrl = infra.relay.url,
+                    keyConfigUrl = wrongDistributor.keyConfigUrl,
+                    defaultKeyConfigBytes = wrongKeyConfigBytes,
                 )
             )
 
@@ -217,7 +208,7 @@ class EndToEndTest {
             }
             assertEquals(400, failure.code)
         } finally {
-            wrongGateway.close()
+            wrongDistributor.close()
         }
     }
 
@@ -226,7 +217,7 @@ class EndToEndTest {
         val client = makeClient(
             OhttpInterceptor(
                 gatewayUrl = gatewayUrl,
-                relayUrl = relay.url,
+                relayUrl = infra.relay.url,
                 // Reachable host, but no key configuration published there.
                 keyConfigUrl = origin.url("/.well-known/ohttp-gateway"),
             )

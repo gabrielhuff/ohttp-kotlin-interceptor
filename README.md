@@ -126,8 +126,11 @@ straight to and from OkHttp `Request`/`Response`.
 ## Validation
 
 `EndToEndTest` exercises client → relay → gateway → origin → gateway → relay →
-client using only our own implementation (an `InProcessRelay` and
-`InProcessGateway` backed by `MockWebServer`). It verifies the encapsulated
+client using only our own implementation — an `InProcessRelay`,
+`InProcessGateway`, and `InProcessKeyDistributor` (aggregated by
+`InProcessOhttpInfra`), all backed by `MockWebServer`. The gateway is the exact
+mirror of the client, driving the same symmetric `Ohttp` methods in reverse. It
+verifies the encapsulated
 round trip for GET and POST, that unconfigured hosts pass through untouched,
 that the relay only ever sees opaque encapsulated bytes, and the key-management
 paths: fetch-on-first-use, automatic refresh-and-retry after the gateway rotates

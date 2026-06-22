@@ -1,6 +1,7 @@
-package io.github.gabrielhuff.ohttp
+package io.github.gabrielhuff.ohttp.internal
 
-import io.github.gabrielhuff.ohttp.internal.Ohttp
+import io.github.gabrielhuff.ohttp.OhttpKeyFetchException
+import io.github.gabrielhuff.ohttp.OhttpKeyParseException
 import okhttp3.CacheControl
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient

@@ -1,5 +1,20 @@
+@file:OptIn(ExperimentalStdlibApi::class) // ByteArray.toHexString()
+
 package io.github.gabrielhuff.ohttp.internal
 
+import io.github.gabrielhuff.ohttp.OhttpDecapsulationException
+import io.github.gabrielhuff.ohttp.OhttpKeyMismatchException
+import io.github.gabrielhuff.ohttp.OhttpRequestEncodingException
+import io.github.gabrielhuff.ohttp.OhttpUnexpectedResponseException
+import okhttp3.HttpUrl
+import okhttp3.MediaType
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import org.bouncycastle.crypto.hpke.AEAD
 import org.bouncycastle.crypto.hpke.HPKE
 import org.bouncycastle.crypto.hpke.HPKEContext
@@ -7,7 +22,6 @@ import org.bouncycastle.crypto.hpke.HPKEContextWithEncapsulation
 import org.bouncycastle.crypto.params.AsymmetricKeyParameter
 import java.nio.ByteBuffer
 import java.security.SecureRandom
-import java.util.HexFormat
 import kotlin.math.max
 
 /**
@@ -55,15 +69,24 @@ internal class HpkeSuite(
 }
 
 /**
- * RFC 9458 message-level encapsulation. This object knows nothing about HTTP —
- * it operates on opaque request/response bytes (which the caller produces via
- * BHTTP). Both client and gateway primitives live here so the in-process relay
- * test infrastructure can share them.
+ * RFC 9458 message-level encapsulation, expressed in terms of OkHttp
+ * `Request`/`Response`. The four orchestration entry points compose BHTTP
+ * framing (RFC 9292) with HPKE (the private byte-level seal/open primitives at
+ * the bottom of this file) and are exact mirrors across the two roles:
+ *
+ *  * client  — [encapsulateRequest] (inner → outer) ⟷ [decapsulateResponse] (outer → inner)
+ *  * gateway — [decapsulateRequest] (outer → inner) ⟷ [encapsulateResponse] (inner → outer)
+ *
+ * The byte-level HPKE primitives are kept private so RFC 9458 test vectors and
+ * the in-process gateway exercise the same crypto the client does.
  */
 internal object Ohttp {
 
     const val REQUEST_MEDIA_TYPE: String = "message/ohttp-req"
     const val RESPONSE_MEDIA_TYPE: String = "message/ohttp-res"
+
+    private val REQUEST_CONTENT_TYPE: MediaType = REQUEST_MEDIA_TYPE.toMediaType()
+    private val RESPONSE_CONTENT_TYPE: MediaType = RESPONSE_MEDIA_TYPE.toMediaType()
 
     private const val REQUEST_INFO_LABEL = "message/bhttp request"
     private const val RESPONSE_EXPORT_LABEL = "message/bhttp response"
@@ -99,7 +122,7 @@ internal object Ohttp {
         }
 
         override fun toString(): String =
-            "KeyConfig(keyId=$keyId, kemId=0x${"%04x".format(kemId)}, pk=${HexFormat.of().formatHex(publicKey)}, " +
+            "KeyConfig(keyId=$keyId, kemId=0x${"%04x".format(kemId)}, pk=${publicKey.toHexString()}, " +
                 "symmetric=$symmetricAlgorithms)"
 
         companion object {
@@ -159,35 +182,18 @@ internal object Ohttp {
         }
     }
 
-    // --- Client side ---
-
-    data class EncapsulatedRequest(val ciphertext: ByteArray, val context: ClientContext)
-
-    class ClientContext internal constructor(
+    /**
+     * HPKE context shared by both peers of one exchange (the receiver context on
+     * the gateway, the sender context on the client) plus the encapsulated KEM
+     * key. Carries everything needed to derive the response AEAD (RFC 9458 §4.5).
+     */
+    class EncapsulationContext internal constructor(
         internal val suite: HpkeSuite,
         internal val hpke: HPKEContext,
         internal val enc: ByteArray,
     )
 
-    fun encapsulateRequest(config: KeyConfig, plaintext: ByteArray): EncapsulatedRequest {
-        val suite = config.pickSupportedSuite()
-        val hdr = suite.header(config.keyId)
-        val info = REQUEST_INFO_LABEL.toByteArray(Charsets.US_ASCII) + 0x00.toByte() + hdr
-        val pkR: AsymmetricKeyParameter = suite.hpke.deserializePublicKey(config.publicKey)
-        val ctx: HPKEContextWithEncapsulation = suite.hpke.setupBaseS(pkR, info)
-        val ct = ctx.seal(EMPTY_AAD, plaintext)
-        val out = hdr + ctx.encapsulation + ct
-        return EncapsulatedRequest(out, ClientContext(suite, ctx, ctx.encapsulation))
-    }
-
-    fun decapsulateResponse(context: ClientContext, encResponse: ByteArray): ByteArray {
-        val (responseNonce, ct) = splitResponseNonce(context.suite, encResponse)
-        val aead = deriveResponseAead(context.hpke, context.suite, context.enc, responseNonce)
-        return aead.open(EMPTY_AAD, ct)
-    }
-
-    // --- Gateway side ---
-
+    /** Gateway's HPKE keypair plus the suite/keyId it is published under. */
     class GatewayKey(
         val keyId: Int,
         val suite: HpkeSuite,
@@ -195,20 +201,124 @@ internal object Ohttp {
         val publicKey: ByteArray,
     )
 
-    class GatewayContext internal constructor(
-        internal val suite: HpkeSuite,
-        internal val hpke: HPKEContext,
-        internal val enc: ByteArray,
-    )
+    /** An [request] addressed to the relay, carrying the encapsulated payload, plus its [context]. */
+    data class EncapsulatedRequest(val request: Request, val context: EncapsulationContext)
 
-    data class DecapsulatedRequest(val plaintext: ByteArray, val context: GatewayContext)
+    /** The inner [request] recovered from an encapsulated payload, plus the gateway-side [context]. */
+    data class DecapsulatedRequest(val request: Request, val context: EncapsulationContext)
 
-    fun decapsulateRequest(gateway: GatewayKey, encRequest: ByteArray): DecapsulatedRequest {
+    // --- Client side ---
+
+    /**
+     * Encapsulates [request] for [config]'s gateway and wraps it as a `POST` to
+     * [relayUrl]. Throws [OhttpRequestEncodingException] if the request can't be
+     * BHTTP-encoded (e.g. a streaming/duplex body) or HPKE-sealed.
+     */
+    fun encapsulateRequest(request: Request, config: KeyConfig, relayUrl: HttpUrl): EncapsulatedRequest {
+        val bhttp = try {
+            Bhttp.encodeRequest(request)
+        } catch (e: Exception) {
+            throw OhttpRequestEncodingException("failed to encode request as BHTTP", e)
+        }
+        val (ciphertext, context) = try {
+            seal(config, bhttp)
+        } catch (e: Exception) {
+            throw OhttpRequestEncodingException("failed to encapsulate request", e)
+        }
+        val relayRequest = Request.Builder()
+            .url(relayUrl)
+            .post(ciphertext.toRequestBody(REQUEST_CONTENT_TYPE))
+            .header("Accept", RESPONSE_MEDIA_TYPE)
+            .build()
+        return EncapsulatedRequest(relayRequest, context)
+    }
+
+    /**
+     * Decodes the relay's [response] back into the origin [Response], anchored to
+     * [original]. Closes [response]. An origin-level error (404, 500, …) arrives
+     * *inside* a valid `message/ohttp-res` and is returned normally. Otherwise it
+     * throws: a 4xx → [OhttpKeyMismatchException], any other unexpected HTTP
+     * outcome → [OhttpUnexpectedResponseException], and an ohttp-res that won't
+     * decrypt/decode → [OhttpDecapsulationException].
+     */
+    fun decapsulateResponse(response: Response, context: EncapsulationContext, original: Request): Response {
+        response.use { resp ->
+            if (resp.isSuccessful && isOhttpResponse(resp)) {
+                val encResponse = resp.body?.bytes()
+                    ?: throw OhttpUnexpectedResponseException("OHTTP relay returned an empty body", resp.code)
+                val bhttp = try {
+                    open(context, encResponse)
+                } catch (e: Exception) {
+                    throw OhttpDecapsulationException("failed to decapsulate OHTTP response", e)
+                }
+                return try {
+                    Bhttp.decodeResponse(bhttp, original)
+                } catch (e: Exception) {
+                    throw OhttpDecapsulationException("failed to decode BHTTP response", e)
+                }
+            }
+
+            val code = resp.code
+            // A 4xx from the relay/gateway means the gateway could not decapsulate
+            // our request — read as a probable key rejection. Anything else (5xx, a
+            // wrong content type, an empty body) a key refresh would not fix.
+            if (!resp.isSuccessful && code in 400..499) {
+                throw OhttpKeyMismatchException(
+                    "gateway rejected the encapsulated request (HTTP $code); key configuration may be outdated",
+                    code,
+                )
+            }
+            throw OhttpUnexpectedResponseException("OHTTP relay returned an unexpected response (HTTP $code)", code)
+        }
+    }
+
+    // --- Gateway side ---
+
+    /** Recovers the inner [Request] from the encapsulated payload carried by [request]'s body. */
+    fun decapsulateRequest(request: Request, gateway: GatewayKey): DecapsulatedRequest {
+        val buffer = Buffer()
+        request.body?.writeTo(buffer)
+        val (plaintext, context) = open(gateway, buffer.readByteArray())
+        return DecapsulatedRequest(Bhttp.decodeRequest(plaintext), context)
+    }
+
+    /** Encapsulates the origin's [response] into a `message/ohttp-res` [Response]. */
+    fun encapsulateResponse(response: Response, context: EncapsulationContext): Response {
+        val ciphertext = seal(context, Bhttp.encodeResponse(response))
+        return Response.Builder()
+            .request(response.request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .header("Content-Type", RESPONSE_MEDIA_TYPE)
+            .body(ciphertext.toResponseBody(RESPONSE_CONTENT_TYPE))
+            .build()
+    }
+
+    // --- byte-level HPKE primitives ---
+
+    private fun seal(config: KeyConfig, plaintext: ByteArray): Pair<ByteArray, EncapsulationContext> {
+        val suite = config.pickSupportedSuite()
+        val hdr = suite.header(config.keyId)
+        val info = REQUEST_INFO_LABEL.toByteArray(Charsets.US_ASCII) + 0x00.toByte() + hdr
+        val pkR: AsymmetricKeyParameter = suite.hpke.deserializePublicKey(config.publicKey)
+        val ctx: HPKEContextWithEncapsulation = suite.hpke.setupBaseS(pkR, info)
+        val ct = ctx.seal(EMPTY_AAD, plaintext)
+        return (hdr + ctx.encapsulation + ct) to EncapsulationContext(suite, ctx, ctx.encapsulation)
+    }
+
+    private fun open(context: EncapsulationContext, encResponse: ByteArray): ByteArray {
+        val (responseNonce, ct) = splitResponseNonce(context.suite, encResponse)
+        val aead = deriveResponseAead(context.hpke, context.suite, context.enc, responseNonce)
+        return aead.open(EMPTY_AAD, ct)
+    }
+
+    private fun open(gateway: GatewayKey, encRequest: ByteArray): Pair<ByteArray, EncapsulationContext> {
         require(encRequest.size >= HEADER_LEN) { "encapsulated request too short" }
         val expectedHdr = gateway.suite.header(gateway.keyId)
         val hdr = encRequest.copyOfRange(0, HEADER_LEN)
         require(hdr.contentEquals(expectedHdr)) {
-            "encapsulated request header does not match gateway config (got=${hdr.toHex()}, want=${expectedHdr.toHex()})"
+            "encapsulated request header does not match gateway config (got=${hdr.toHexString()}, want=${expectedHdr.toHexString()})"
         }
         val encLen = gateway.suite.encLength
         require(encRequest.size >= HEADER_LEN + encLen) { "encapsulated request truncated" }
@@ -219,10 +329,10 @@ internal object Ohttp {
         val skR = gateway.suite.hpke.deserializePrivateKey(gateway.privateKey, gateway.publicKey)
         val ctx = gateway.suite.hpke.setupBaseR(enc, skR, info)
         val pt = ctx.open(EMPTY_AAD, ct)
-        return DecapsulatedRequest(pt, GatewayContext(gateway.suite, ctx, enc))
+        return pt to EncapsulationContext(gateway.suite, ctx, enc)
     }
 
-    fun encapsulateResponse(context: GatewayContext, response: ByteArray): ByteArray {
+    private fun seal(context: EncapsulationContext, response: ByteArray): ByteArray {
         val nonceLen = max(context.suite.nN, context.suite.nK)
         val responseNonce = ByteArray(nonceLen).also(secureRandom::nextBytes)
         val aead = deriveResponseAead(context.hpke, context.suite, context.enc, responseNonce)
@@ -231,6 +341,11 @@ internal object Ohttp {
     }
 
     // --- shared helpers ---
+
+    private fun isOhttpResponse(response: Response): Boolean {
+        val contentType = response.body?.contentType()?.toString() ?: return false
+        return contentType.startsWith(RESPONSE_MEDIA_TYPE)
+    }
 
     private fun splitResponseNonce(suite: HpkeSuite, encResponse: ByteArray): Pair<ByteArray, ByteArray> {
         val nonceLen = max(suite.nN, suite.nK)
@@ -255,5 +370,3 @@ internal object Ohttp {
         return AEAD(suite.aeadId, aeadKey, aeadNonce)
     }
 }
-
-private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
