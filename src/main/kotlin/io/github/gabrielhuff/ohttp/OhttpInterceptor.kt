@@ -2,50 +2,67 @@ package io.github.gabrielhuff.ohttp
 
 import io.github.gabrielhuff.ohttp.internal.Bhttp
 import io.github.gabrielhuff.ohttp.internal.Ohttp
+import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 
 /**
- * OkHttp [Interceptor] that turns regular HTTP(S) calls to configured target
- * hosts into Oblivious HTTP exchanges (RFC 9458). Requests to hosts that are
- * not in [configs] are passed through unchanged.
+ * OkHttp [Interceptor] that turns regular HTTP(S) calls to a single gateway
+ * host into Oblivious HTTP exchanges (RFC 9458). Requests whose host does not
+ * match [gatewayUrl] are passed through unchanged. To proxy more than one
+ * gateway, install one interceptor per gateway.
  *
- * For each match, the interceptor:
+ * For each matching request, the interceptor:
  *  1. Serializes the [Request] to a BHTTP message (RFC 9292).
  *  2. Encapsulates the BHTTP bytes with HPKE using the gateway's public key.
- *  3. POSTs the encapsulated payload to the relay URL configured for that host.
+ *  3. POSTs the encapsulated payload to [relayUrl] via `chain.proceed`, so the
+ *     relay leg reuses the same client (connection pool, timeouts, proxy).
  *  4. Decapsulates the response and reconstructs an OkHttp [Response].
  *
- * Register it as an **application** interceptor so the original [Request]'s
- * URL host is observable. Do not register the same interceptor on the client
- * passed as [relayClient], or the relay request would be re-intercepted.
+ * Install it as an **application** interceptor so the original [Request]'s URL
+ * host is observable. The relay request flows through `chain.proceed`, which
+ * descends to later interceptors and the network — it never re-enters this
+ * interceptor, so there is no risk of recursively encapsulating it.
+ *
+ * @param gatewayUrl identifies which requests to encapsulate (matched by host).
+ * @param relayUrl where the encapsulated request is POSTed.
+ * @param keyConfigBytes the gateway's published key configuration (RFC 9458
+ *   §3.1), as opaque bytes. Parsed on first use; if `null` (or unparseable) the
+ *   interceptor throws when it first needs to encapsulate a request.
  */
 public class OhttpInterceptor @JvmOverloads constructor(
-    configs: Map<String, OhttpConfig>,
-    private val relayClient: OkHttpClient = OkHttpClient(),
+    private val gatewayUrl: HttpUrl,
+    private val relayUrl: HttpUrl,
+    keyConfigBytes: ByteArray? = null,
 ) : Interceptor {
 
-    private val configs: Map<String, OhttpConfig> = configs.toMap()
+    // Parsed lazily so a future key-config discovery path can do I/O on the
+    // first intercepted request. For now a missing config is treated like an
+    // unparseable one — it throws the first time the gateway is used.
+    private val keyConfig: Ohttp.KeyConfig by lazy {
+        val bytes = keyConfigBytes
+            ?: throw IllegalArgumentException("no key configuration provided for gateway $gatewayUrl")
+        Ohttp.KeyConfig.parse(bytes)
+    }
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
-        val config = configs[original.url.host] ?: return chain.proceed(original)
+        if (original.url.host != gatewayUrl.host) return chain.proceed(original)
 
         val bhttpBytes = Bhttp.encodeRequest(original)
-        val encapsulated = Ohttp.encapsulateRequest(config.keyConfig, bhttpBytes)
+        val encapsulated = Ohttp.encapsulateRequest(keyConfig, bhttpBytes)
 
         val relayRequest = Request.Builder()
-            .url(config.relayUrl)
+            .url(relayUrl)
             .post(encapsulated.ciphertext.toRequestBody(REQUEST_CONTENT_TYPE))
             .header("Accept", Ohttp.RESPONSE_MEDIA_TYPE)
             .build()
 
-        relayClient.newCall(relayRequest).execute().use { resp ->
+        chain.proceed(relayRequest).use { resp ->
             if (!resp.isSuccessful) {
                 throw IOException("OHTTP relay returned HTTP ${resp.code} ${resp.message}")
             }

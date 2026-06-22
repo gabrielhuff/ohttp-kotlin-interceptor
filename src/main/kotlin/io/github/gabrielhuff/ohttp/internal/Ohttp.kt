@@ -75,8 +75,9 @@ internal object Ohttp {
 
     /**
      * Parsed OHTTP key configuration (RFC 9458 §3.1). This is an implementation
-     * detail of encapsulation — the public API only ever deals in the opaque
-     * published bytes (see [io.github.gabrielhuff.ohttp.OhttpConfig]).
+     * detail of encapsulation — the public API
+     * ([io.github.gabrielhuff.ohttp.OhttpInterceptor]) only ever deals in the
+     * opaque published bytes.
      */
     class KeyConfig(
         val keyId: Int,

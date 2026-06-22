@@ -1,7 +1,7 @@
 package io.github.gabrielhuff.ohttp.testing
 
-import io.github.gabrielhuff.ohttp.OhttpConfig
 import io.github.gabrielhuff.ohttp.OhttpInterceptor
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -46,11 +46,14 @@ class EndToEndTest {
     }
 
     private fun makeClient(): OkHttpClient {
-        val configs = mapOf(
-            "api.example.com" to OhttpConfig(relay.url.toString(), gateway.keyConfigBytes),
-        )
         return OkHttpClient.Builder()
-            .addInterceptor(OhttpInterceptor(configs))
+            .addInterceptor(
+                OhttpInterceptor(
+                    gatewayUrl = "https://api.example.com".toHttpUrl(),
+                    relayUrl = relay.url,
+                    keyConfigBytes = gateway.keyConfigBytes,
+                )
+            )
             .build()
     }
 
