@@ -2,7 +2,16 @@ package io.github.gabrielhuff.ohttp.internal
 
 import java.nio.ByteBuffer
 
-// QUIC variable-length integer encoding (RFC 9000 §16). Used by BHTTP (RFC 9292).
+/**
+ * QUIC variable-length integer encoding (RFC 9000 §16).
+ *
+ * API:
+ * - [write] serializes a non-negative [Long] into a [ByteBuffer]
+ * - [read] deserializes the next varint from a [ByteBuffer] to a [Long]
+ * - [MAX_BYTES] upper bound on an encoded varint, for sizing buffers
+ *
+ * Used by [Bhttp].
+ */
 internal object Varint {
 
     /** The most bytes a single varint can occupy; useful for sizing output buffers. */

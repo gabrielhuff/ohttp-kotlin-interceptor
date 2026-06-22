@@ -9,14 +9,20 @@ import okhttp3.Request
 import java.io.IOException
 
 /**
- * Owns the gateway's key configuration: holds the current parsed config in
- * memory, seeds it from optional default bytes, and (re)fetches it from
+ * Owns the gateway's key configuration (RFC 9458 §3.1): holds the current parsed
+ * config in memory, seeds it from optional default bytes, and (re)fetches it from
  * [keyConfigUrl] when needed.
  *
  * The in-memory parsed config is the source of truth. Any [okhttp3.Cache] on
  * [keyConfigClient] only affects how the *fetch* behaves on the wire (conditional
  * requests, persistence across restarts); the manager never relies on it as the
  * primary store, which is why a bad default is simply ignored rather than cached.
+ *
+ * API:
+ * - [get] returns the current key config, fetching (single-flighted) on first use
+ * - [refresh] forces a refetch, bypassing any HTTP cache
+ *
+ * Used by [io.github.gabrielhuff.ohttp.OhttpInterceptor].
  */
 internal class KeyConfigManager(
     private val keyConfigUrl: HttpUrl,

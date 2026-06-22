@@ -13,15 +13,16 @@ import okio.Buffer
 import java.nio.ByteBuffer
 
 /**
- * Binary HTTP Messages, RFC 9292 — known-length variant only. RFC 9458 §4
- * mandates known-length for OHTTP request and response messages, so we
- * intentionally don't implement the indeterminate-length variant.
+ * Binary HTTP Messages (RFC 9292) — known-length variant only. RFC 9458 §4
+ * mandates known-length for OHTTP request and response messages, so the
+ * indeterminate-length variant is intentionally not implemented. Translates
+ * OkHttp [Request] / [Response] straight to and from the BHTTP wire format.
  *
- * This object translates OkHttp's [Request] / [Response] straight to and from
- * the BHTTP wire format. The client path (`encodeRequest` / `decodeResponse`)
- * runs in [io.github.gabrielhuff.ohttp.OhttpInterceptor]; the gateway path
- * (`decodeRequest` / `encodeResponse`) is exercised by the in-process test
- * gateway.
+ * API:
+ * - [encodeRequest] / [decodeResponse] — client side: [Request] → BHTTP, BHTTP → [Response]
+ * - [decodeRequest] / [encodeResponse] — gateway side: BHTTP → [Request], [Response] → BHTTP
+ *
+ * Used by [Ohttp], which frames messages here before/after HPKE.
  */
 internal object Bhttp {
 

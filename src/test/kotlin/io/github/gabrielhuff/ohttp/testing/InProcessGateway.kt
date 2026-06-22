@@ -1,6 +1,5 @@
 package io.github.gabrielhuff.ohttp.testing
 
-import io.github.gabrielhuff.ohttp.internal.HpkeSuite
 import io.github.gabrielhuff.ohttp.internal.Ohttp
 import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -45,7 +44,7 @@ internal class InProcessGateway(
     private val server: MockWebServer = MockWebServer(),
 ) : Closeable {
 
-    private val suite = HpkeSuite(kemId.toShort(), kdfId.toShort(), aeadId.toShort())
+    private val suite = Ohttp.HpkeSuite(kemId.toShort(), kdfId.toShort(), aeadId.toShort())
 
     private class KeyState(
         val gatewayKey: Ohttp.GatewayKey,
