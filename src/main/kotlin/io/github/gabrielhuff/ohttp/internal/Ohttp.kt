@@ -1,12 +1,13 @@
 package io.github.gabrielhuff.ohttp.internal
 
-import io.github.gabrielhuff.ohttp.KeyConfig
 import org.bouncycastle.crypto.hpke.AEAD
 import org.bouncycastle.crypto.hpke.HPKE
 import org.bouncycastle.crypto.hpke.HPKEContext
 import org.bouncycastle.crypto.hpke.HPKEContextWithEncapsulation
 import org.bouncycastle.crypto.params.AsymmetricKeyParameter
+import java.nio.ByteBuffer
 import java.security.SecureRandom
+import java.util.HexFormat
 import kotlin.math.max
 
 /**
@@ -47,17 +48,9 @@ internal class HpkeSuite(
         return byteArrayOf(keyId.toByte()) + u16(kemId) + u16(kdfId) + u16(aeadId)
     }
 
-    companion object {
-        val X25519_SHA256_AES128GCM = HpkeSuite(
-            HPKE.kem_X25519_SHA256,
-            HPKE.kdf_HKDF_SHA256,
-            HPKE.aead_AES_GCM128,
-        )
-
-        private fun u16(v: Short): ByteArray {
-            val i = v.toInt() and 0xFFFF
-            return byteArrayOf((i ushr 8).toByte(), i.toByte())
-        }
+    private fun u16(v: Short): ByteArray {
+        val i = v.toInt() and 0xFFFF
+        return byteArrayOf((i ushr 8).toByte(), i.toByte())
     }
 }
 
@@ -77,7 +70,93 @@ internal object Ohttp {
 
     private const val HEADER_LEN = 7
 
+    private val EMPTY_AAD = ByteArray(0)
     private val secureRandom = SecureRandom()
+
+    /**
+     * Parsed OHTTP key configuration (RFC 9458 §3.1). This is an implementation
+     * detail of encapsulation — the public API only ever deals in the opaque
+     * published bytes (see [io.github.gabrielhuff.ohttp.OhttpConfig]).
+     */
+    class KeyConfig(
+        val keyId: Int,
+        val kemId: Int,
+        val publicKey: ByteArray,
+        val symmetricAlgorithms: List<SymmetricAlgorithmPair>,
+    ) {
+        data class SymmetricAlgorithmPair(val kdfId: Int, val aeadId: Int)
+
+        // First (KDF, AEAD) pair from the config that we can actually instantiate.
+        fun pickSupportedSuite(): HpkeSuite {
+            check(kemId in SUPPORTED_KEM_IDS) { "unsupported KEM 0x${"%04x".format(kemId)}" }
+            for (pair in symmetricAlgorithms) {
+                if (pair.kdfId !in SUPPORTED_KDF_IDS) continue
+                if (pair.aeadId !in SUPPORTED_AEAD_IDS) continue
+                return HpkeSuite(kemId.toShort(), pair.kdfId.toShort(), pair.aeadId.toShort())
+            }
+            error("no supported symmetric algorithm pair in key config: $symmetricAlgorithms")
+        }
+
+        override fun toString(): String =
+            "KeyConfig(keyId=$keyId, kemId=0x${"%04x".format(kemId)}, pk=${HexFormat.of().formatHex(publicKey)}, " +
+                "symmetric=$symmetricAlgorithms)"
+
+        companion object {
+            // HPKE primitives we accept from a published key configuration. Values
+            // are the RFC 9180 §7 registry identifiers; BouncyCastle implements all
+            // of these.
+            private val SUPPORTED_KEM_IDS = setOf(0x0010, 0x0011, 0x0012, 0x0020)
+            private val SUPPORTED_KDF_IDS = setOf(0x0001, 0x0002, 0x0003)
+            private val SUPPORTED_AEAD_IDS = setOf(0x0001, 0x0002, 0x0003)
+
+            fun parse(bytes: ByteArray): KeyConfig {
+                val src = ByteBuffer.wrap(bytes)
+                val keyId = src.get().toInt() and 0xFF
+                val kemId = src.short.toInt() and 0xFFFF
+                val npk = publicKeySizeForKem(kemId)
+                require(src.remaining() >= npk) { "key config truncated: missing public key" }
+                val publicKey = ByteArray(npk)
+                src.get(publicKey)
+                require(src.remaining() >= 2) { "key config truncated: missing symmetric algorithms length" }
+                val symLen = src.short.toInt() and 0xFFFF
+                require(symLen % 4 == 0) { "symmetric algorithms section must be a multiple of 4 bytes" }
+                require(src.remaining() >= symLen) { "key config truncated: missing symmetric algorithms" }
+                val syms = buildList {
+                    val end = src.position() + symLen
+                    while (src.position() < end) {
+                        val kdf = src.short.toInt() and 0xFFFF
+                        val aead = src.short.toInt() and 0xFFFF
+                        add(SymmetricAlgorithmPair(kdf, aead))
+                    }
+                }
+                require(!src.hasRemaining()) { "trailing bytes in key config" }
+                return KeyConfig(keyId, kemId, publicKey, syms)
+            }
+
+            fun serialize(config: KeyConfig): ByteArray {
+                val buf = ByteBuffer.allocate(5 + config.publicKey.size + config.symmetricAlgorithms.size * 4)
+                buf.put(config.keyId.toByte())
+                buf.putShort(config.kemId.toShort())
+                buf.put(config.publicKey)
+                buf.putShort((config.symmetricAlgorithms.size * 4).toShort())
+                for (pair in config.symmetricAlgorithms) {
+                    buf.putShort(pair.kdfId.toShort())
+                    buf.putShort(pair.aeadId.toShort())
+                }
+                return buf.array()
+            }
+
+            // RFC 9180 §7.1 — Npk for each KEM.
+            private fun publicKeySizeForKem(kemId: Int): Int = when (kemId) {
+                0x0010 -> 65   // P-256 uncompressed
+                0x0011 -> 97   // P-384
+                0x0012 -> 133  // P-521
+                0x0020 -> 32   // X25519
+                0x0021 -> 56   // X448
+                else -> throw IllegalArgumentException("unknown KEM id 0x${"%04x".format(kemId)}")
+            }
+        }
+    }
 
     // --- Client side ---
 
@@ -174,8 +253,6 @@ internal object Ohttp {
         val aeadNonce = hpke.expand(prk, "nonce".toByteArray(Charsets.US_ASCII), suite.nN)
         return AEAD(suite.aeadId, aeadKey, aeadNonce)
     }
-
-    private val EMPTY_AAD = ByteArray(0)
 }
 
-internal fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

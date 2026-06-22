@@ -1,6 +1,5 @@
 package io.github.gabrielhuff.ohttp.testing
 
-import io.github.gabrielhuff.ohttp.KeyConfig
 import io.github.gabrielhuff.ohttp.internal.Bhttp
 import io.github.gabrielhuff.ohttp.internal.HpkeSuite
 import io.github.gabrielhuff.ohttp.internal.Ohttp
@@ -42,14 +41,14 @@ internal class InProcessGateway(
     private val privateKey: ByteArray = suite.hpke.serializePrivateKey(keyPair.private)
     private val gatewayKey = Ohttp.GatewayKey(keyId, suite, privateKey, publicKey)
 
-    val keyConfig: KeyConfig = KeyConfig(
+    val keyConfig: Ohttp.KeyConfig = Ohttp.KeyConfig(
         keyId = keyId,
         kemId = kemId,
         publicKey = publicKey,
-        symmetricAlgorithms = listOf(KeyConfig.SymmetricAlgorithmPair(kdfId = kdfId, aeadId = aeadId)),
+        symmetricAlgorithms = listOf(Ohttp.KeyConfig.SymmetricAlgorithmPair(kdfId = kdfId, aeadId = aeadId)),
     )
 
-    val keyConfigBytes: ByteArray = KeyConfig.serialize(keyConfig)
+    val keyConfigBytes: ByteArray = Ohttp.KeyConfig.serialize(keyConfig)
 
     init {
         server.dispatcher = object : Dispatcher() {

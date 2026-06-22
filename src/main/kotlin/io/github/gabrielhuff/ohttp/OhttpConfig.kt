@@ -1,5 +1,7 @@
 package io.github.gabrielhuff.ohttp
 
+import io.github.gabrielhuff.ohttp.internal.Ohttp
+
 /**
  * Per-target configuration. Wraps the relay URL the encapsulated request
  * should be POSTed to, plus the gateway's published OHTTP key configuration
@@ -14,5 +16,5 @@ public class OhttpConfig(
     public val relayUrl: String,
     public val keyConfigBytes: ByteArray,
 ) {
-    internal val keyConfig: KeyConfig = KeyConfig.parse(keyConfigBytes)
+    internal val keyConfig: Ohttp.KeyConfig = Ohttp.KeyConfig.parse(keyConfigBytes)
 }

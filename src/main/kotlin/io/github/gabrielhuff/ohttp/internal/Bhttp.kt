@@ -10,8 +10,6 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
-import java.io.ByteArrayOutputStream
-import java.io.DataOutputStream
 import java.nio.ByteBuffer
 
 /**
@@ -34,26 +32,30 @@ internal object Bhttp {
 
     fun encodeRequest(request: Request): ByteArray {
         val body = readBody(request)
-        val baos = ByteArrayOutputStream(estimatedSize(request, body))
-        val out = DataOutputStream(baos)
-        Varint.write(out, FRAMING_KNOWN_LENGTH_REQUEST.toLong())
+        val method = request.method.toByteArray(Charsets.US_ASCII)
+        val scheme = request.url.scheme.toByteArray(Charsets.US_ASCII)
+        val authority = authorityOf(request.url).toByteArray(Charsets.US_ASCII)
+        val path = pathWithQueryOf(request.url).toByteArray(Charsets.US_ASCII)
+        val fieldSection = encodeFieldSection(requestFields(request, body))
 
+        val buf = ByteBuffer.allocate(
+            Varint.MAX_BYTES +                      // framing
+                lengthPrefixed(method) + lengthPrefixed(scheme) +
+                lengthPrefixed(authority) + lengthPrefixed(path) +
+                lengthPrefixed(fieldSection) +      // field section
+                lengthPrefixed(body) +              // known-length content
+                Varint.MAX_BYTES,                   // trailers
+        )
+        Varint.write(buf, FRAMING_KNOWN_LENGTH_REQUEST.toLong())
         // Request Control Data.
-        writeLengthPrefixed(out, request.method.toByteArray(Charsets.US_ASCII))
-        writeLengthPrefixed(out, request.url.scheme.toByteArray(Charsets.US_ASCII))
-        writeLengthPrefixed(out, authorityOf(request.url).toByteArray(Charsets.US_ASCII))
-        writeLengthPrefixed(out, pathWithQueryOf(request.url).toByteArray(Charsets.US_ASCII))
-
-        writeFieldSection(out, requestFields(request, body))
-
-        // Known-length content.
-        Varint.write(out, body.size.toLong())
-        out.write(body)
-
-        // Trailers: empty.
-        Varint.write(out, 0L)
-
-        return baos.toByteArray()
+        writeLengthPrefixed(buf, method)
+        writeLengthPrefixed(buf, scheme)
+        writeLengthPrefixed(buf, authority)
+        writeLengthPrefixed(buf, path)
+        writeLengthPrefixed(buf, fieldSection)
+        writeLengthPrefixed(buf, body)
+        Varint.write(buf, 0L) // empty trailers
+        return buf.toByteArray()
     }
 
     // --- Request: BHTTP -> OkHttp (gateway side) ---
@@ -69,10 +71,7 @@ internal object Bhttp {
         val authority = readLengthPrefixedAscii(src)
         val path = readLengthPrefixedAscii(src)
         val headers = readFieldSection(src)
-        val contentLen = Varint.read(src).toInt()
-        require(src.remaining() >= contentLen) { "BHTTP request truncated in content section" }
-        val body = ByteArray(contentLen)
-        src.get(body)
+        val body = readContent(src)
         // Trailers and any padding are ignored.
 
         val url = "$scheme://$authority$path".toHttpUrl()
@@ -97,17 +96,24 @@ internal object Bhttp {
     fun encodeResponse(response: Response): ByteArray {
         val bodyObj = response.body
         val body = bodyObj?.bytes() ?: ByteArray(0)
-        val baos = ByteArrayOutputStream(64 + body.size)
-        val out = DataOutputStream(baos)
-        Varint.write(out, FRAMING_KNOWN_LENGTH_RESPONSE.toLong())
+        val fieldSection = encodeFieldSection(
+            responseFields(response, bodyObj?.contentType()?.toString(), body.size),
+        )
+
+        val buf = ByteBuffer.allocate(
+            Varint.MAX_BYTES +                  // framing
+                Varint.MAX_BYTES +              // status code
+                lengthPrefixed(fieldSection) +  // field section
+                lengthPrefixed(body) +          // known-length content
+                Varint.MAX_BYTES,               // trailers
+        )
+        Varint.write(buf, FRAMING_KNOWN_LENGTH_RESPONSE.toLong())
         // No informational responses emitted.
-        Varint.write(out, response.code.toLong())
-        writeFieldSection(out, responseFields(response, bodyObj?.contentType()?.toString(), body.size))
-        Varint.write(out, body.size.toLong())
-        out.write(body)
-        // Trailers: empty.
-        Varint.write(out, 0L)
-        return baos.toByteArray()
+        Varint.write(buf, response.code.toLong())
+        writeLengthPrefixed(buf, fieldSection)
+        writeLengthPrefixed(buf, body)
+        Varint.write(buf, 0L) // empty trailers
+        return buf.toByteArray()
     }
 
     // --- Response: BHTTP -> OkHttp (client side) ---
@@ -130,10 +136,7 @@ internal object Bhttp {
             headers = readFieldSection(src)
             if (status >= 200) break
         }
-        val contentLen = Varint.read(src).toInt()
-        require(src.remaining() >= contentLen) { "BHTTP response truncated in content section" }
-        val body = ByteArray(contentLen)
-        src.get(body)
+        val body = readContent(src)
         // Trailers and any padding are ignored.
 
         val contentType = headers.firstOrNull { it.first.equals("Content-Type", ignoreCase = true) }
@@ -184,31 +187,21 @@ internal object Bhttp {
     private fun Headers.toPairs(): List<Pair<String, String>> =
         (0 until size).map { name(it) to value(it) }
 
-    // --- BHTTP framing helpers ---
+    // --- BHTTP field section framing ---
 
-    private fun writeLengthPrefixed(out: DataOutputStream, bytes: ByteArray) {
-        Varint.write(out, bytes.size.toLong())
-        out.write(bytes)
-    }
-
-    private fun readLengthPrefixedAscii(src: ByteBuffer): String {
-        val len = Varint.read(src).toInt()
-        val arr = ByteArray(len)
-        src.get(arr)
-        return arr.toString(Charsets.US_ASCII)
-    }
-
-    private fun writeFieldSection(out: DataOutputStream, fields: List<Pair<String, String>>) {
-        // Serialize to an inner buffer first so we can prefix the section
-        // with its total length (a varint).
-        val inner = ByteArrayOutputStream(64)
-        val innerOut = DataOutputStream(inner)
-        for ((name, value) in fields) {
-            writeLengthPrefixed(innerOut, name.toByteArray(Charsets.US_ASCII))
-            writeLengthPrefixed(innerOut, value.toByteArray(Charsets.ISO_8859_1))
+    // A field section is itself length-prefixed, so we encode it to its own
+    // byte array first and let the caller write the outer length prefix.
+    private fun encodeFieldSection(fields: List<Pair<String, String>>): ByteArray {
+        val encoded = fields.map { (name, value) ->
+            name.toByteArray(Charsets.US_ASCII) to value.toByteArray(Charsets.ISO_8859_1)
         }
-        Varint.write(out, inner.size().toLong())
-        inner.writeTo(out)
+        val capacity = encoded.sumOf { (name, value) -> lengthPrefixed(name) + lengthPrefixed(value) }
+        val buf = ByteBuffer.allocate(capacity)
+        for ((name, value) in encoded) {
+            writeLengthPrefixed(buf, name)
+            writeLengthPrefixed(buf, value)
+        }
+        return buf.toByteArray()
     }
 
     private fun readFieldSection(src: ByteBuffer): List<Pair<String, String>> {
@@ -220,16 +213,42 @@ internal object Bhttp {
         src.position(src.position() + len)
         val out = ArrayList<Pair<String, String>>()
         while (inner.hasRemaining()) {
-            val nameLen = Varint.read(inner).toInt()
-            val nameBytes = ByteArray(nameLen)
-            inner.get(nameBytes)
-            val valueLen = Varint.read(inner).toInt()
-            val valueBytes = ByteArray(valueLen)
-            inner.get(valueBytes)
-            out.add(nameBytes.toString(Charsets.US_ASCII) to valueBytes.toString(Charsets.ISO_8859_1))
+            val name = readLengthPrefixed(inner)
+            val value = readLengthPrefixed(inner)
+            out.add(name.toString(Charsets.US_ASCII) to value.toString(Charsets.ISO_8859_1))
         }
         return out
     }
+
+    // --- varint length-prefixed primitives ---
+
+    /** Upper bound on the encoded size of a length-prefixed byte string. */
+    private fun lengthPrefixed(bytes: ByteArray): Int = Varint.MAX_BYTES + bytes.size
+
+    private fun writeLengthPrefixed(buf: ByteBuffer, bytes: ByteArray) {
+        Varint.write(buf, bytes.size.toLong())
+        buf.put(bytes)
+    }
+
+    private fun readLengthPrefixed(src: ByteBuffer): ByteArray {
+        val len = Varint.read(src).toInt()
+        val arr = ByteArray(len)
+        src.get(arr)
+        return arr
+    }
+
+    private fun readLengthPrefixedAscii(src: ByteBuffer): String =
+        readLengthPrefixed(src).toString(Charsets.US_ASCII)
+
+    private fun readContent(src: ByteBuffer): ByteArray {
+        val len = Varint.read(src).toInt()
+        require(src.remaining() >= len) { "BHTTP message truncated in content section" }
+        val body = ByteArray(len)
+        src.get(body)
+        return body
+    }
+
+    private fun ByteBuffer.toByteArray(): ByteArray = array().copyOf(position())
 
     // --- OkHttp URL / body helpers ---
 
@@ -252,14 +271,6 @@ internal object Bhttp {
     }
 
     private fun methodAllowsBody(method: String): Boolean = method !in setOf("GET", "HEAD", "DELETE")
-
-    private fun estimatedSize(request: Request, body: ByteArray): Int {
-        var n = 16 + request.method.length + request.url.scheme.length +
-            request.url.host.length + request.url.encodedPath.length
-        for (i in 0 until request.headers.size) n += 4 + request.headers.name(i).length + request.headers.value(i).length
-        n += body.size + 8
-        return n
-    }
 
     private fun reasonPhrase(status: Int): String = when (status) {
         200 -> "OK"
