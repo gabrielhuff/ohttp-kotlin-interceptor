@@ -1,6 +1,8 @@
 package io.github.gabrielhuff.ohttp.testing
 
 import io.github.gabrielhuff.ohttp.OhttpInterceptor
+import io.github.gabrielhuff.ohttp.OhttpKeyFetchException
+import io.github.gabrielhuff.ohttp.OhttpKeyMismatchException
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -12,6 +14,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 
@@ -45,17 +48,20 @@ class EndToEndTest {
         origin.shutdown()
     }
 
-    private fun makeClient(): OkHttpClient {
-        return OkHttpClient.Builder()
-            .addInterceptor(
-                OhttpInterceptor(
-                    gatewayUrl = "https://api.example.com".toHttpUrl(),
-                    relayUrl = relay.url,
-                    keyConfigBytes = gateway.keyConfigBytes,
-                )
-            )
-            .build()
-    }
+    private val gatewayUrl = "https://api.example.com".toHttpUrl()
+
+    private fun makeClient(interceptor: OhttpInterceptor = makeInterceptor()): OkHttpClient =
+        OkHttpClient.Builder().addInterceptor(interceptor).build()
+
+    // Seeded with the gateway's current key and the *default* (unreachable)
+    // well-known key URL — so if a fetch were wrongly triggered it would fail,
+    // proving the seed alone serves these tests.
+    private fun makeInterceptor(): OhttpInterceptor =
+        OhttpInterceptor(
+            gatewayUrl = gatewayUrl,
+            relayUrl = relay.url,
+            defaultKeyConfigBytes = gateway.keyConfigBytes,
+        )
 
     @Test
     fun `GET request is end-to-end encapsulated through the relay`() {
@@ -133,6 +139,105 @@ class EndToEndTest {
         assertEquals(204, response.code)
         val req = origin.takeRequest()
         assertEquals("/passthrough", req.path)
+    }
+
+    @Test
+    fun `key config is fetched on first use when no default is provided`() {
+        origin.enqueue(MockResponse().setResponseCode(200).setBody("fetched"))
+
+        // No seed: the interceptor must pull the key from the gateway's
+        // published well-known endpoint before it can encapsulate.
+        val client = makeClient(
+            OhttpInterceptor(
+                gatewayUrl = gatewayUrl,
+                relayUrl = relay.url,
+                keyConfigUrl = gateway.keyConfigUrl,
+            )
+        )
+
+        val response = client.newCall(
+            Request.Builder().url("https://api.example.com/v1/status").build()
+        ).execute()
+
+        assertEquals(200, response.code)
+        assertEquals("fetched", response.body!!.string())
+    }
+
+    @Test
+    fun `key rotation is recovered by an automatic refresh and retry`() {
+        origin.enqueue(MockResponse().setResponseCode(200).setBody("before"))
+        origin.enqueue(MockResponse().setResponseCode(200).setBody("after"))
+
+        // Seeded with the current key, and pointed at the reachable key endpoint
+        // so the post-rotation refresh can succeed.
+        val client = makeClient(
+            OhttpInterceptor(
+                gatewayUrl = gatewayUrl,
+                relayUrl = relay.url,
+                keyConfigUrl = gateway.keyConfigUrl,
+                defaultKeyConfigBytes = gateway.keyConfigBytes,
+            )
+        )
+
+        val first = client.newCall(
+            Request.Builder().url("https://api.example.com/v1/status").build()
+        ).execute()
+        assertEquals("before", first.body!!.string())
+
+        // Gateway rotates: the seeded key is now stale and will be rejected.
+        gateway.rotateKey()
+
+        val second = client.newCall(
+            Request.Builder().url("https://api.example.com/v1/status").build()
+        ).execute()
+        assertEquals(200, second.code)
+        assertEquals("after", second.body!!.string())
+    }
+
+    @Test
+    fun `a key the gateway never accepts surfaces as OhttpKeyMismatchException`() {
+        // A second gateway with an unrelated keypair. We feed its key (both as
+        // seed and via its key URL) to the interceptor, but route traffic through
+        // the *real* gateway — which can never decapsulate it, even after refresh.
+        val wrongGateway = InProcessGateway()
+        try {
+            val client = makeClient(
+                OhttpInterceptor(
+                    gatewayUrl = gatewayUrl,
+                    relayUrl = relay.url,
+                    keyConfigUrl = wrongGateway.keyConfigUrl,
+                    defaultKeyConfigBytes = wrongGateway.keyConfigBytes,
+                )
+            )
+
+            val failure = assertThrows(OhttpKeyMismatchException::class.java) {
+                client.newCall(
+                    Request.Builder().url("https://api.example.com/v1/status").build()
+                ).execute()
+            }
+            assertEquals(400, failure.code)
+        } finally {
+            wrongGateway.close()
+        }
+    }
+
+    @Test
+    fun `a failing key endpoint surfaces as OhttpKeyFetchException`() {
+        val client = makeClient(
+            OhttpInterceptor(
+                gatewayUrl = gatewayUrl,
+                relayUrl = relay.url,
+                // Reachable host, but no key configuration published there.
+                keyConfigUrl = origin.url("/.well-known/ohttp-gateway"),
+            )
+        )
+        origin.enqueue(MockResponse().setResponseCode(404))
+
+        assertThrows(OhttpKeyFetchException::class.java) {
+            client.newCall(
+                Request.Builder().url("https://api.example.com/v1/status").build()
+            ).execute()
+        }
     }
 
     @Test

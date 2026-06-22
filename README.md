@@ -11,11 +11,11 @@ HPKE crypto is provided by BouncyCastle (`org.bouncycastle:bcprov-jdk18on`).
 
 ## Layout
 
-A single library module. The public API is one type — `OhttpInterceptor` in
-`io.github.gabrielhuff.ohttp`. Everything else (BHTTP framing, HPKE, OHTTP
-encapsulation, key-config parsing) lives in `io.github.gabrielhuff.ohttp.internal`
-and works directly against OkHttp's `Request`/`Response` — there are no
-intermediate, stack-neutral message types.
+A single library module. The public API in `io.github.gabrielhuff.ohttp` is
+`OhttpInterceptor` plus the `OhttpException` family it throws. Everything else
+(BHTTP framing, HPKE, OHTTP encapsulation, key-config parsing/fetching) lives in
+`io.github.gabrielhuff.ohttp.internal` and works directly against OkHttp's
+`Request`/`Response` — there are no intermediate, stack-neutral message types.
 
 ## Usage
 
@@ -25,13 +25,14 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-val keyConfigBytes: ByteArray = /* Fetch from /.well-known/ohttp-gateway or ship out-of-band */
 val client = OkHttpClient.Builder()
     .addInterceptor(
         OhttpInterceptor(
             gatewayUrl = "https://api.example.com".toHttpUrl(),
             relayUrl = "https://relay.fastly-edge.example/ohttp".toHttpUrl(),
-            keyConfigBytes = keyConfigBytes,
+            // Optional: seed the key so the first request needs no fetch.
+            // Omit it and the key is pulled from the well-known endpoint instead.
+            defaultKeyConfigBytes = keyConfigBytes,
         )
     )
     .build()
@@ -54,16 +55,54 @@ else through.
   host matches `gatewayUrl.host`; all other requests pass through untouched.
 * `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
   relay endpoint.
-* `keyConfigBytes` — the gateway's published OHTTP Key Configuration
-  (RFC 9458 §3.1), opaque bytes. We deliberately accept the wire bytes rather
-  than a parsed structure so that **rotating keys is a byte-array swap**. It is
-  nullable to reserve room for future auto-discovery from `gatewayUrl`; until
-  then a `null` (or unparseable) value throws on first use.
+* `keyConfigUrl` — where the gateway's OHTTP Key Configuration (RFC 9458 §3.1) is
+  fetched from. Defaults to the **RFC 9540 §4.1** well-known endpoint derived
+  from `gatewayUrl` (`https://{gateway-host}/.well-known/ohttp-gateway`).
+* `keyConfigClient` — the `OkHttpClient` used for that fetch. The default is a
+  fresh, cache-less client. Supply one backed by an `okhttp3.Cache` (on Android,
+  built from `context.cacheDir`) for persistence, or one routed through the relay
+  for stronger metadata privacy.
+* `defaultKeyConfigBytes` — optional initial key configuration to seed the
+  in-memory cache so the first request needs no round trip. Unparseable bytes are
+  ignored — the interceptor just fetches instead.
 
 The encapsulated request is sent to the relay via `chain.proceed`, so the relay
 leg reuses the same `OkHttpClient` (connection pool, timeouts, proxy). Because
 `chain.proceed` descends to later interceptors and the network rather than
 restarting the chain, the relay request is never re-intercepted.
+
+### Key management
+
+The in-memory parsed key configuration is the source of truth (seeded from
+`defaultKeyConfigBytes` if given). When the gateway rotates keys, the first
+affected request is rejected, the interceptor refetches the config from
+`keyConfigUrl`, and retries the request **once**. Callers can also force a
+refresh proactively — e.g. on app foreground:
+
+```kotlin
+val interceptor = OhttpInterceptor(gatewayUrl, relayUrl)
+// ...
+interceptor.refreshKey() // blocking; throws OhttpKeyFetchException / OhttpKeyParseException
+```
+
+### Errors
+
+Every interceptor-originated failure is a `sealed class OhttpException : IOException`,
+so existing `catch (IOException)` handlers keep working while callers can
+`when`-match for detail:
+
+| Exception | Meaning |
+|---|---|
+| `OhttpKeyParseException` | key bytes (default or fetched) are not a valid configuration |
+| `OhttpKeyFetchException` | couldn't download the key config (network, non-2xx, empty body) |
+| `OhttpKeyMismatchException` | gateway rejected the request even after a refresh (key outdated/not registered) |
+| `OhttpRequestEncodingException` | request can't be encapsulated (e.g. a streaming/duplex body — OHTTP needs a bufferable request) |
+| `OhttpUnexpectedResponseException` | relay returned an unexpected status, content type, or empty body |
+| `OhttpDecapsulationException` | response was OHTTP-shaped but couldn't be decrypted/decoded |
+
+Transport errors talking to the relay (relay unreachable, socket timeouts) and
+call cancellation propagate as plain `IOException`, exactly as for any other
+OkHttp call.
 
 ## Crypto details
 
@@ -90,7 +129,10 @@ straight to and from OkHttp `Request`/`Response`.
 client using only our own implementation (an `InProcessRelay` and
 `InProcessGateway` backed by `MockWebServer`). It verifies the encapsulated
 round trip for GET and POST, that unconfigured hosts pass through untouched,
-and that the relay only ever sees opaque encapsulated bytes.
+that the relay only ever sees opaque encapsulated bytes, and the key-management
+paths: fetch-on-first-use, automatic refresh-and-retry after the gateway rotates
+keys, and the `OhttpKeyFetchException` / `OhttpKeyMismatchException` failure
+modes.
 
 Broader automated coverage (BHTTP/varint/key-config unit tests, reference-
 implementation interop) is intended to follow.

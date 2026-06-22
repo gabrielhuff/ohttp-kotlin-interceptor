@@ -18,6 +18,12 @@ import java.io.Closeable
  * [keyConfigBytes], decapsulates incoming OHTTP requests, dispatches the
  * decoded HTTP request through [originClient], and re-wraps the response.
  *
+ * It also publishes its current key configuration over HTTP at
+ * [keyConfigUrl] (`application/ohttp-keys`), so the interceptor's key-fetch
+ * path can be exercised. [rotateKey] generates a fresh keypair, which makes
+ * any request encapsulated against the old config fail to decapsulate — the
+ * mechanism used to test rotation/refresh.
+ *
  * Defaults to the Fastly/Cloudflare baseline suite
  * (X25519 + HKDF-SHA256 + AES-128-GCM).
  *
@@ -27,28 +33,49 @@ import java.io.Closeable
  */
 internal class InProcessGateway(
     val keyId: Int = 0x01,
-    kemId: Int = 0x0020,
-    kdfId: Int = 0x0001,
-    aeadId: Int = 0x0001,
+    private val kemId: Int = 0x0020,
+    private val kdfId: Int = 0x0001,
+    private val aeadId: Int = 0x0001,
     private val originClient: OkHttpClient = OkHttpClient(),
     private val server: MockWebServer = MockWebServer(),
     private val hostRewriter: ((HttpUrl) -> HttpUrl)? = null,
 ) : Closeable {
 
     private val suite = HpkeSuite(kemId.toShort(), kdfId.toShort(), aeadId.toShort())
-    private val keyPair = suite.hpke.generatePrivateKey()
-    private val publicKey: ByteArray = suite.hpke.serializePublicKey(keyPair.public)
-    private val privateKey: ByteArray = suite.hpke.serializePrivateKey(keyPair.private)
-    private val gatewayKey = Ohttp.GatewayKey(keyId, suite, privateKey, publicKey)
 
-    val keyConfig: Ohttp.KeyConfig = Ohttp.KeyConfig(
-        keyId = keyId,
-        kemId = kemId,
-        publicKey = publicKey,
-        symmetricAlgorithms = listOf(Ohttp.KeyConfig.SymmetricAlgorithmPair(kdfId = kdfId, aeadId = aeadId)),
+    private class KeyState(
+        val gatewayKey: Ohttp.GatewayKey,
+        val keyConfig: Ohttp.KeyConfig,
+        val keyConfigBytes: ByteArray,
     )
 
-    val keyConfigBytes: ByteArray = Ohttp.KeyConfig.serialize(keyConfig)
+    @Volatile
+    private var state: KeyState = generateKeyState()
+
+    /** Generates a fresh keypair, invalidating any config previously published. */
+    fun rotateKey() {
+        state = generateKeyState()
+    }
+
+    private fun generateKeyState(): KeyState {
+        val keyPair = suite.hpke.generatePrivateKey()
+        val publicKey = suite.hpke.serializePublicKey(keyPair.public)
+        val privateKey = suite.hpke.serializePrivateKey(keyPair.private)
+        val keyConfig = Ohttp.KeyConfig(
+            keyId = keyId,
+            kemId = kemId,
+            publicKey = publicKey,
+            symmetricAlgorithms = listOf(Ohttp.KeyConfig.SymmetricAlgorithmPair(kdfId = kdfId, aeadId = aeadId)),
+        )
+        return KeyState(
+            gatewayKey = Ohttp.GatewayKey(keyId, suite, privateKey, publicKey),
+            keyConfig = keyConfig,
+            keyConfigBytes = Ohttp.KeyConfig.serialize(keyConfig),
+        )
+    }
+
+    val keyConfig: Ohttp.KeyConfig get() = state.keyConfig
+    val keyConfigBytes: ByteArray get() = state.keyConfigBytes
 
     init {
         server.dispatcher = object : Dispatcher() {
@@ -60,11 +87,21 @@ internal class InProcessGateway(
     val url: HttpUrl
         get() = server.url("/ohttp")
 
+    /** Where the current key configuration is published (RFC 9540 §4.1 media type). */
+    val keyConfigUrl: HttpUrl
+        get() = server.url("/.well-known/ohttp-gateway")
+
     override fun close() {
         server.shutdown()
     }
 
     private fun handle(request: RecordedRequest): MockResponse {
+        if (request.method == "GET" && request.path == "/.well-known/ohttp-gateway") {
+            return MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/ohttp-keys")
+                .setBody(okio.Buffer().write(state.keyConfigBytes))
+        }
         if (request.method != "POST" || request.path != "/ohttp") {
             return MockResponse().setResponseCode(404)
         }
@@ -75,7 +112,7 @@ internal class InProcessGateway(
 
         val encReq = request.body.readByteArray()
         val decReq = try {
-            Ohttp.decapsulateRequest(gatewayKey, encReq)
+            Ohttp.decapsulateRequest(state.gatewayKey, encReq)
         } catch (t: Throwable) {
             return MockResponse().setResponseCode(400).setBody("decapsulation failed: ${t.message}")
         }
