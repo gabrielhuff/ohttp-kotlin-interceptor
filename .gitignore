@@ -5,8 +5,3 @@ build/
 .idea/
 .kotlin/
 local.properties
-
-# Rust build artifacts for the reference binaries (Cargo.lock IS committed
-# for reproducible interop runs).
-interop/reference-gateway/target/
-interop/reference-relay/target/

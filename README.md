@@ -6,36 +6,33 @@ in and your traffic goes through an OHTTP relay; remove it and the same client
 makes ordinary HTTP requests. Designed to work with Fastly's OHTTP relay/gateway
 deployments and any other RFC 9458 implementation.
 
-Pure JVM — no Android-specific code. Crypto is provided exclusively by
-Google Tink (`com.google.crypto.tink:tink:1.21.0`).
+Pure JVM — no Android-specific code. A single Gradle module built around OkHttp.
+HPKE crypto is provided by BouncyCastle (`org.bouncycastle:bcprov-jdk18on`).
 
-## Modules
+## Layout
 
-| Module        | Artifact                   | Purpose                                                                                                                                                                                                                  |
-|---------------|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `core`        | `ohttp-kotlin-core`        | HTTP-stack-agnostic implementation: BHTTP (RFC 9292), HPKE Base + Export on Tink primitives, OHTTP encapsulation (RFC 9458), `KeyConfig`, `OhttpConfig`. Depends only on Tink + Okio. No OkHttp.                          |
-| `interceptor` | `ohttp-kotlin-interceptor` | `OhttpInterceptor` for OkHttp, plus the small `OkHttpBhttpAdapter` that translates between OkHttp `Request`/`Response` and `:core`'s neutral BHTTP types.                                                                  |
-| `testing`     | `ohttp-kotlin-testing`     | `InProcessRelay` (fake Fastly) and `InProcessGateway` for integration tests.                                                                                                                                              |
-| `cronet`      | `ohttp-kotlin-cronet`      | `OhttpCronetEngine` / `OhttpUrlRequest` — Cronet-native wrapper that talks straight to `:core` (no OkHttp on the runtime classpath). Cronet API is compileOnly; consumers add `org.chromium.net:cronet-api` from Google Maven. |
+A single library module. The public API in `io.github.gabrielhuff.ohttp` is
+`OhttpInterceptor` plus the `OhttpException` family it throws. Everything else
+(BHTTP framing, HPKE, OHTTP encapsulation, key-config parsing/fetching) lives in
+`io.github.gabrielhuff.ohttp.internal` and works directly against OkHttp's
+`Request`/`Response` — there are no intermediate, stack-neutral message types.
 
 ## Usage
 
 ```kotlin
-import io.github.gabrielhuff.ohttp.OhttpConfig
 import io.github.gabrielhuff.ohttp.OhttpInterceptor
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Request
 
-val keyConfigBytes: ByteArray = /* Fetch from /.well-known/ohttp-gateway or ship out-of-band */
 val client = OkHttpClient.Builder()
     .addInterceptor(
         OhttpInterceptor(
-            mapOf(
-                "api.example.com" to OhttpConfig(
-                    relayUrl = "https://relay.fastly-edge.example/ohttp",
-                    keyConfigBytes = keyConfigBytes,
-                ),
-            )
+            gatewayUrl = "https://api.example.com".toHttpUrl(),
+            relayUrl = "https://relay.fastly-edge.example/ohttp".toHttpUrl(),
+            // Optional: seed the key so the first request needs no fetch.
+            // Omit it and the key is pulled from the well-known endpoint instead.
+            defaultKeyConfigBytes = keyConfigBytes,
         )
     )
     .build()
@@ -45,160 +42,106 @@ val client = OkHttpClient.Builder()
 client.newCall(Request.Builder().url("https://api.example.com/v1/things").build()).execute()
 ```
 
-### Removing the interceptor
+### One gateway per interceptor
 
-Drop it from the `OkHttpClient.Builder`, or supply an empty map. Either way,
-the rest of your client stack is unaffected — the same OkHttp instance happily
-makes plain HTTP requests.
+Each `OhttpInterceptor` handles a single gateway. To proxy more than one
+gateway, install one interceptor per gateway on the same client — each only
+acts on requests whose host matches its own `gatewayUrl` and passes everything
+else through.
 
 ### Configuration model
 
-The interceptor takes a `Map<String, OhttpConfig>` keyed by **target hostname**
-(exact match against `HttpUrl.host`). Each `OhttpConfig` bundles:
-
+* `gatewayUrl` — the gateway being proxied. Requests are intercepted when their
+  host matches `gatewayUrl.host`; all other requests pass through untouched.
 * `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
   relay endpoint.
-* `keyConfigBytes` — the gateway's published OHTTP Key Configuration
-  (RFC 9458 §3.1), opaque bytes. We deliberately accept the wire bytes rather
-  than a parsed structure so that **rotating keys is a byte-array swap**.
+* `keyConfigUrl` — where the gateway's OHTTP Key Configuration (RFC 9458 §3.1) is
+  fetched from. Defaults to the **RFC 9540 §4.1** well-known endpoint derived
+  from `gatewayUrl` (`https://{gateway-host}/.well-known/ohttp-gateway`).
+* `keyConfigClient` — the `OkHttpClient` used for that fetch. The default is a
+  fresh, cache-less client. Supply one backed by an `okhttp3.Cache` (on Android,
+  built from `context.cacheDir`) for persistence, or one routed through the relay
+  for stronger metadata privacy.
+* `defaultKeyConfigBytes` — optional initial key configuration to seed the
+  in-memory cache so the first request needs no round trip. Unparseable bytes are
+  ignored — the interceptor just fetches instead.
 
-The interceptor uses a dedicated `OkHttpClient` to talk to the relay so the
-relay request is **not** re-intercepted. Provide your own via the second
-constructor argument if you need custom timeouts, proxy, etc.
+The encapsulated request is sent to the relay via `chain.proceed`, so the relay
+leg reuses the same `OkHttpClient` (connection pool, timeouts, proxy). Because
+`chain.proceed` descends to later interceptors and the network rather than
+restarting the chain, the relay request is never re-intercepted.
+
+### Key management
+
+The in-memory parsed key configuration is the source of truth (seeded from
+`defaultKeyConfigBytes` if given). When the gateway rotates keys, the first
+affected request is rejected, the interceptor refetches the config from
+`keyConfigUrl`, and retries the request **once**. Callers can also force a
+refresh proactively — e.g. on app foreground:
+
+```kotlin
+val interceptor = OhttpInterceptor(gatewayUrl, relayUrl)
+// ...
+interceptor.refreshKey() // blocking; throws OhttpKeyFetchException / OhttpKeyParseException
+```
+
+### Errors
+
+Every interceptor-originated failure is a `sealed class OhttpException : IOException`,
+so existing `catch (IOException)` handlers keep working while callers can
+`when`-match for detail:
+
+| Exception | Meaning |
+|---|---|
+| `OhttpKeyParseException` | key bytes (default or fetched) are not a valid configuration |
+| `OhttpKeyFetchException` | couldn't download the key config (network, non-2xx, empty body) |
+| `OhttpKeyMismatchException` | gateway rejected the request even after a refresh (key outdated/not registered) |
+| `OhttpRequestEncodingException` | request can't be encapsulated (e.g. a streaming/duplex body — OHTTP needs a bufferable request) |
+| `OhttpUnexpectedResponseException` | relay returned an unexpected status, content type, or empty body |
+| `OhttpDecapsulationException` | response was OHTTP-shaped but couldn't be decrypted/decoded |
+
+Transport errors talking to the relay (relay unreachable, socket timeouts) and
+call cancellation propagate as plain `IOException`, exactly as for any other
+OkHttp call.
 
 ## Crypto details
 
-* **HPKE base-mode**, suite **DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 /
-  AES-128-GCM** (Fastly/Cloudflare default). Adding more suites is a matter of
-  extending `HpkeSuite` and `KeyConfig.pickSupportedSuite`.
-* The HPKE KEM, KDF, and AEAD primitives come from Tink. Because Tink's
-  `HpkeContext` does not expose HPKE `Export`, we re-implement the **KeySchedule**
-  on top of Tink's `HpkeKdf`/`HpkeAead` primitives and derive the response key
-  per RFC 9458 §4.5 with plain HKDF (JDK `Mac`).
-* A small Java shim in `com.google.crypto.tink.hybrid.internal.OhttpHpkeBridge`
-  exposes two package-private Tink helpers (`hpkeSuiteId`, `kem.encapsulate`)
-  rather than using reflection. If a future Tink release promotes them, the
-  bridge can be deleted.
+* **HPKE base-mode**, default suite **DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 /
+  AES-128-GCM** (Fastly/Cloudflare default). The published key configuration
+  selects the suite; the key-config parser accepts the four KEMs and three
+  KDF/AEAD pairs in the RFC 9180 §7 registry that BouncyCastle implements.
+* The HPKE KEM/KDF/AEAD primitives, the key schedule, and `Export` all come from
+  BouncyCastle's public `org.bouncycastle.crypto.hpke.HPKEContext`. Because that
+  type exposes `Export` (and raw HKDF `Extract`/`Expand`) directly, the OHTTP
+  response key derivation (RFC 9458 §4.5) is a handful of calls with no
+  library-internal access and no hand-rolled key schedule.
 
 ## Binary HTTP
 
 `io.github.gabrielhuff.ohttp.internal.Bhttp` implements **known-length**
 request/response framing only — that's what RFC 9458 §4 mandates for OHTTP.
-Indeterminate-length framing is intentionally not implemented.
-
-## In-process relay & gateway
-
-```kotlin
-import io.github.gabrielhuff.ohttp.testing.InProcessGateway
-import io.github.gabrielhuff.ohttp.testing.InProcessRelay
-
-val origin = MockWebServer().apply { start() }
-val gateway = InProcessGateway(hostRewriter = { it.newBuilder().host(origin.hostName).port(origin.port).scheme("http").build() })
-val relay = InProcessRelay(gatewayUrl = gateway.url)
-
-val client = OkHttpClient.Builder()
-    .addInterceptor(OhttpInterceptor(mapOf("api.example.com" to OhttpConfig(relay.url.toString(), gateway.keyConfigBytes))))
-    .build()
-```
-
-`InProcessRelay` is a real OHTTP relay: it forwards `message/ohttp-req` byte
-streams to the configured gateway without decrypting them.
+Indeterminate-length framing is intentionally not implemented. It translates
+straight to and from OkHttp `Request`/`Response`.
 
 ## Validation
 
-The unit tests in `interceptor/src/test/` cover BHTTP, QUIC varints, RFC 9458
-key configs (including the appendix test vector), and the OHTTP request/response
-crypto round-trip.
+`EndToEndTest` exercises client → relay → gateway → origin → gateway → relay →
+client using only our own implementation — an `InProcessRelay`,
+`InProcessGateway`, and `InProcessKeyDistributor` (aggregated by
+`InProcessOhttpInfra`), all backed by `MockWebServer`. The gateway is the exact
+mirror of the client, driving the same symmetric `Ohttp` methods in reverse. It
+verifies the encapsulated
+round trip for GET and POST, that unconfigured hosts pass through untouched,
+that the relay only ever sees opaque encapsulated bytes, and the key-management
+paths: fetch-on-first-use, automatic refresh-and-retry after the gateway rotates
+keys, and the `OhttpKeyFetchException` / `OhttpKeyMismatchException` failure
+modes.
 
-The `testing` module's tests cover:
+Broader automated coverage (BHTTP/varint/key-config unit tests, reference-
+implementation interop) is intended to follow.
 
-1. **End-to-end self-loop** — `EndToEndTest` exercises
-   client → relay → gateway → origin → gateway → relay → client using only
-   our own implementation. Verifies the interceptor is the only thing standing
-   between OHTTP and plain HTTP.
-
-2. **Reference gateway interop** — `ReferenceGatewayInteropTest` runs the
-   same loop against [`martinthomson/ohttp`](https://github.com/martinthomson/ohttp),
-   the OHTTP spec author's Rust implementation (using the `rust-hpke`
-   backend, so no NSS install required). The wrapper binary lives in
-   `interop/reference-gateway`; the Gradle test task builds it automatically
-   when `cargo` is available on PATH and skips the interop test cleanly
-   otherwise.
-
-3. **Reference relay interop** — `ReferenceRelayInteropTest` chains a
-   second reference: [`payjoin/ohttp-relay`](https://github.com/payjoin/ohttp-relay)
-   (pure-Rust on hyper/tokio; the closest equivalent to a martinthomson-
-   maintained relay, which doesn't exist). Topology: client →
-   reference-relay (payjoin) → reference-gateway (martinthomson) → origin.
-   Validates wire-level HTTP plumbing across two independent implementations.
-   The relay performs a BIP77 opt-in probe of the gateway before forwarding;
-   our reference gateway answers that probe positively so the chain can
-   form.
-
-Run everything with:
+Run the tests with:
 
 ```
 gradle test
 ```
-
-## Cronet integration
-
-The `cronet` module wraps a `CronetEngine`. Build a Cronet `UrlRequest` via
-`OhttpCronetEngine` instead of the engine directly:
-
-```kotlin
-val ohttpEngine = OhttpCronetEngine(
-    delegate = realCronetEngine,
-    configs = mapOf("api.example.com" to OhttpConfig(relayUrl, keyConfigBytes)),
-)
-
-val request = ohttpEngine.newUrlRequestBuilder(
-    "https://api.example.com/v1/things",
-    callback,
-    callbackExecutor,
-)
-    .setHttpMethod("POST")
-    .addHeader("Content-Type", "application/json")
-    .setUploadDataProvider(uploadProvider, uploadExecutor)
-    .build()
-
-request.start()
-```
-
-Requests to hosts not in the map fall through to the wrapped `CronetEngine`
-verbatim. The relay leg also goes via the wrapped engine, so HTTP/3 and
-connection migration apply to client→relay traffic.
-
-The module depends on Cronet at **compile time only**. Add the real artifact
-in your app's build:
-
-```kotlin
-implementation("org.chromium.net:cronet-api:119.6045.31")
-// And one of the Cronet implementations: cronet-embedded (full),
-// Google Play Services provider, or HttpEngine.
-```
-
-(Cronet artifacts are hosted on `https://maven.google.com/`; add that repo to
-your build if it isn't already.)
-
-> **Building this repo:** Google's `org.chromium.net:cronet-api` lives only on
-> Google Maven, which isn't reachable from CI here, so the build resolves the
-> equivalent `com.androidacy:cronet-api` mirror from Maven Central as a normal
-> dependency. Since every `cronet-api` is packaged as an Android `.aar` and
-> `:cronet` is a plain `kotlin("jvm")` module with no Android plugin, an artifact
-> transform (`ExtractAarJars` in `cronet/build.gradle.kts`) unpacks the API jar from
-> the `.aar` — the same mechanism the Android Gradle Plugin uses internally. The API
-> is `compileOnly`, so it never enters the published jar. Once Google Maven is
-> reachable you can point the coordinate at the official artifact above; it's an
-> `.aar` too, so the transform keeps working unchanged.
-
-### Known limitations vs. native Cronet
-
-- **One-shot.** OHTTP doesn't stream, so request/response bodies are buffered
-  end to end. Don't use this path for large uploads/downloads if memory is
-  tight.
-- **No transparent redirect following.** `UrlRequest.followRedirect()` throws.
-  3xx responses are surfaced as the final response; follow them yourself if
-  needed.
-- **`getStatus`** returns a coarse-grained status (engine internals aren't
-  visible to the wrapper).
