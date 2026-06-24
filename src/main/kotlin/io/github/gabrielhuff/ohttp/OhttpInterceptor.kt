@@ -5,6 +5,7 @@ import io.github.gabrielhuff.ohttp.internal.Ohttp
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 
 /**
@@ -61,6 +62,13 @@ public class OhttpInterceptor @JvmOverloads constructor(
 
     private val keys = KeyConfigManager(keyConfigUrl, keyConfigClient, defaultKeyConfigBytes)
 
+    init {
+        // RFC 9458 §6: client->relay and the key-config fetch MUST use HTTPS.
+        // Loopback is allowed so in-process/test deployments can use plain HTTP.
+        requireSecure(relayUrl, "relayUrl")
+        requireSecure(keyConfigUrl, "keyConfigUrl")
+    }
+
     /**
      * Forces a refetch of the gateway's key configuration from `keyConfigUrl`.
      * Blocks on network I/O, so call it off the main thread. Throws
@@ -75,21 +83,31 @@ public class OhttpInterceptor @JvmOverloads constructor(
         val original = chain.request()
         if (original.url.host != targetUrl.host) return chain.proceed(original)
 
+        // RFC 9458 §5.1: a 100-continue expectation cannot be used with OHTTP, so
+        // never encapsulate one (the gateway would reject it).
+        val request = original.withoutExpectContinue()
+
         return try {
-            interceptOhttp(chain)
+            interceptOhttp(chain, request)
         } catch (e: OhttpKeyMismatchException) {
             // The key was outdated/unregistered: refresh and retry exactly once.
             // A second mismatch propagates as the terminal failure.
             keys.refresh()
-            interceptOhttp(chain)
+            interceptOhttp(chain, request)
         }
     }
 
-    private fun interceptOhttp(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val (relayRequest, context) = Ohttp.encapsulateRequest(original, keys.get(), relayUrl)
-        return Ohttp.decapsulateResponse(chain.proceed(relayRequest), context, original)
+    private fun interceptOhttp(chain: Interceptor.Chain, request: Request): Response {
+        val (relayRequest, context) = Ohttp.encapsulateRequest(request, keys.get(), relayUrl)
+        return Ohttp.decapsulateResponse(chain.proceed(relayRequest), context, request)
     }
+
+    private fun Request.withoutExpectContinue(): Request =
+        if (header("Expect")?.equals("100-continue", ignoreCase = true) == true) {
+            newBuilder().removeHeader("Expect").build()
+        } else {
+            this
+        }
 
     private companion object {
         // RFC 9540 §5 locates the Oblivious Gateway Resource at this well-known
@@ -100,5 +118,14 @@ public class OhttpInterceptor @JvmOverloads constructor(
                 .query(null)
                 .fragment(null)
                 .build()
+
+        fun requireSecure(url: HttpUrl, name: String) {
+            require(url.isHttps || isLoopback(url.host)) {
+                "$name must use https (RFC 9458 §6); got ${url.scheme}://${url.host}"
+            }
+        }
+
+        fun isLoopback(host: String): Boolean =
+            host == "localhost" || host == "::1" || host.startsWith("127.")
     }
 }

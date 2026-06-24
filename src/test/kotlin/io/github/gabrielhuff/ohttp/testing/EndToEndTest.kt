@@ -14,6 +14,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -113,6 +114,22 @@ class EndToEndTest {
         // The origin sees a real application/json content type even though OkHttp
         // tracks it on the body rather than in the headers map.
         assertEquals("application/json; charset=utf-8", originReq.getHeader("Content-Type"))
+    }
+
+    @Test
+    fun `100-continue expectation is stripped before encapsulation`() {
+        origin.enqueue(MockResponse().setResponseCode(200).setBody("ok"))
+
+        val response = makeClient().newCall(
+            Request.Builder()
+                .url("https://api.example.com/v1/status")
+                .header("Expect", "100-continue")
+                .build()
+        ).execute()
+
+        assertEquals("ok", response.body!!.string())
+        // The expectation must not reach the target (RFC 9458 §5.1).
+        assertNull(origin.takeRequest().getHeader("Expect"))
     }
 
     @Test

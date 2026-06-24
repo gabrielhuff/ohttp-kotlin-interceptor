@@ -217,6 +217,9 @@ internal object Ohttp {
                 src.get(publicKey)
                 require(src.remaining() >= 2) { "key config truncated: missing symmetric algorithms length" }
                 val symLen = src.short.toInt() and 0xFFFF
+                // RFC 9458 §3.1: HPKE Symmetric Algorithms Length is 4..65532 and,
+                // being whole (KDF, AEAD) pairs, a multiple of 4.
+                require(symLen in 4..65532) { "symmetric algorithms length out of range: $symLen" }
                 require(symLen % 4 == 0) { "symmetric algorithms section must be a multiple of 4 bytes" }
                 require(src.remaining() >= symLen) { "key config truncated: missing symmetric algorithms" }
                 val syms = buildList {

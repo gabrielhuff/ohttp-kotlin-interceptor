@@ -55,7 +55,8 @@ else through.
   relay or gateway. Requests are intercepted when their host matches
   `targetUrl.host`; all other requests pass through untouched.
 * `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
-  relay endpoint.
+  relay endpoint. Must be HTTPS (RFC 9458 §6); loopback hosts are allowed for
+  in-process testing. The same requirement applies to `keyConfigUrl`.
 * `keyConfigUrl` — where the gateway's OHTTP Key Configuration (RFC 9458 §3.1) is
   fetched from. Defaults to `https://{target-host}/.well-known/ohttp-gateway`;
   **RFC 9540 §5** defines that Oblivious Gateway Resource on the target's host.
@@ -89,6 +90,15 @@ val interceptor = OhttpInterceptor(targetUrl, relayUrl)
 // ...
 interceptor.refreshKey() // blocking; throws OhttpKeyFetchException / OhttpKeyParseException
 ```
+
+Detecting an outdated key is necessarily heuristic: RFC 9458 §5.3 notes a client
+"cannot rely on" the gateway's `ohttp-key` problem type, so the interceptor
+refreshes on a non-encapsulated `4xx` from the relay/gateway. That signal also
+makes the retry replay-safe — §5.2 ties a non-encapsulated error to a failure
+*before* decapsulation, i.e. the request was never processed.
+
+`Date`-based anti-replay (RFC 9458 §6.5) is not implemented: requests carry no
+`Date` header and the interceptor does not perform the §6.5.2 clock-skew retry.
 
 ### Errors
 

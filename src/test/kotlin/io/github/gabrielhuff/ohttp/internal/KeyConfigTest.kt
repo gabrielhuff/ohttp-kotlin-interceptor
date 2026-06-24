@@ -71,6 +71,18 @@ class KeyConfigTest {
     }
 
     @Test
+    fun `parse rejects a symmetric algorithms length below the minimum of 4`() {
+        // keyId | kemId(X25519) | 32-byte key | symLen = 0
+        val bytes = ByteBuffer.allocate(1 + 2 + 32 + 2)
+            .put(0x01)
+            .putShort(0x0020)
+            .put(ByteArray(32))
+            .putShort(0)
+            .array()
+        assertThrows<IllegalArgumentException> { KeyConfig.parse(bytes) }
+    }
+
+    @Test
     fun `parse rejects an unknown KEM id`() {
         // keyId | kemId=0x00FF (unknown) — fails before reading the key.
         val bytes = byteArrayOf(0x01, 0x00, 0xFF.toByte())
