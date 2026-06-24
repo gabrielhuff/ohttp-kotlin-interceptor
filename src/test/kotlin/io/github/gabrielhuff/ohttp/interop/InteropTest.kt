@@ -15,16 +15,16 @@ import org.junit.jupiter.api.Test
  * OHTTP is transparent to the response.
  *
  * This talks to the public internet, so it is **opt-in**: it is skipped unless
- * the relay and gateway endpoints are supplied. Configure via system properties
+ * the relay and target endpoints are supplied. Configure via system properties
  * (or the upper-snake-case env var equivalent, e.g. `OHTTP_INTEROP_RELAY`):
  *
  * - `ohttp.interop.relay`     — the OHTTP relay URL (where encapsulated POSTs go)
- * - `ohttp.interop.gateway`   — the target/gateway origin (its host is what gets intercepted)
- * - `ohttp.interop.keyConfig` — key-config URL (optional; defaults to the RFC 9540 well-known on the gateway)
+ * - `ohttp.interop.target`    — the target origin (its host is what gets intercepted)
+ * - `ohttp.interop.keyConfig` — key-config URL (optional; defaults to the RFC 9540 well-known on the target)
  * - `ohttp.interop.path`      — the resource path to GET (default `/`)
  *
  * Candidate target — **Google Safe Browsing**, the most prominent public OHTTP
- * user (Chrome): point `gateway` at `https://safebrowsing.googleapis.com`, a
+ * user (Chrome): point `target` at `https://safebrowsing.googleapis.com`, a
  * `path` at a valid v5 endpoint (with your `?key=API_KEY`), `relay` at the Safe
  * Browsing Fastly relay, and `keyConfig` at Google's published key endpoint.
  * Those relay/gateway endpoints are part of Chrome's deployment rather than a
@@ -39,28 +39,28 @@ class InteropTest {
     @Test
     fun `OHTTP fetch matches a direct fetch of the same resource`() {
         val relay = config("ohttp.interop.relay")
-        val gateway = config("ohttp.interop.gateway")
-        assumeTrue(relay != null && gateway != null) {
-            "interop test skipped — set -Dohttp.interop.relay and -Dohttp.interop.gateway to run"
+        val target = config("ohttp.interop.target")
+        assumeTrue(relay != null && target != null) {
+            "interop test skipped — set -Dohttp.interop.relay and -Dohttp.interop.target to run"
         }
 
-        val gatewayUrl = gateway!!.toHttpUrl()
-        val target = gatewayUrl.newBuilder().encodedPath(config("ohttp.interop.path") ?: "/").build()
+        val targetUrl = target!!.toHttpUrl()
+        val resource = targetUrl.newBuilder().encodedPath(config("ohttp.interop.path") ?: "/").build()
         val keyConfigUrl = config("ohttp.interop.keyConfig")?.toHttpUrl()
 
         val interceptor = if (keyConfigUrl != null) {
-            OhttpInterceptor(gatewayUrl, relay!!.toHttpUrl(), keyConfigUrl)
+            OhttpInterceptor(targetUrl, relay!!.toHttpUrl(), keyConfigUrl)
         } else {
-            OhttpInterceptor(gatewayUrl, relay!!.toHttpUrl())
+            OhttpInterceptor(targetUrl, relay!!.toHttpUrl())
         }
         val ohttpClient = OkHttpClient.Builder().addInterceptor(interceptor).build()
         val directClient = OkHttpClient()
 
-        val direct = directClient.newCall(Request.Builder().url(target).build()).execute()
+        val direct = directClient.newCall(Request.Builder().url(resource).build()).execute()
         val directCode = direct.code
         val directBody = direct.use { it.body!!.bytes() }
 
-        val viaOhttp = ohttpClient.newCall(Request.Builder().url(target).build()).execute()
+        val viaOhttp = ohttpClient.newCall(Request.Builder().url(resource).build()).execute()
         val ohttpBody = viaOhttp.use { it.body!!.bytes() }
 
         // OHTTP must be transparent: same status, and a non-empty body that

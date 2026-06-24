@@ -28,7 +28,7 @@ import okhttp3.Request
 val client = OkHttpClient.Builder()
     .addInterceptor(
         OhttpInterceptor(
-            gatewayUrl = "https://api.example.com".toHttpUrl(),
+            targetUrl = "https://api.example.com".toHttpUrl(),
             relayUrl = "https://relay.fastly-edge.example/ohttp".toHttpUrl(),
             // Optional: seed the key so the first request needs no fetch.
             // Omit it and the key is pulled from the well-known endpoint instead.
@@ -42,22 +42,25 @@ val client = OkHttpClient.Builder()
 client.newCall(Request.Builder().url("https://api.example.com/v1/things").build()).execute()
 ```
 
-### One gateway per interceptor
+### One target per interceptor
 
-Each `OhttpInterceptor` handles a single gateway. To proxy more than one
-gateway, install one interceptor per gateway on the same client — each only
-acts on requests whose host matches its own `gatewayUrl` and passes everything
+Each `OhttpInterceptor` handles a single target. To proxy more than one
+target, install one interceptor per target on the same client — each only
+acts on requests whose host matches its own `targetUrl` and passes everything
 else through.
 
 ### Configuration model
 
-* `gatewayUrl` — the gateway being proxied. Requests are intercepted when their
-  host matches `gatewayUrl.host`; all other requests pass through untouched.
+* `targetUrl` — the target resource being proxied; callers address this, not the
+  relay or gateway. Requests are intercepted when their host matches
+  `targetUrl.host`; all other requests pass through untouched.
 * `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
   relay endpoint.
 * `keyConfigUrl` — where the gateway's OHTTP Key Configuration (RFC 9458 §3.1) is
   fetched from. Defaults to the **RFC 9540 §4.1** well-known endpoint derived
-  from `gatewayUrl` (`https://{gateway-host}/.well-known/ohttp-gateway`).
+  from `targetUrl` (`https://{target-host}/.well-known/ohttp-gateway`), which
+  assumes the gateway is co-located with the target; set it explicitly if your
+  gateway is hosted elsewhere.
 * `keyConfigClient` — the `OkHttpClient` used for that fetch. The default is a
   fresh, cache-less client. Supply one backed by an `okhttp3.Cache` (on Android,
   built from `context.cacheDir`) for persistence, or one routed through the relay
@@ -80,7 +83,7 @@ affected request is rejected, the interceptor refetches the config from
 refresh proactively — e.g. on app foreground:
 
 ```kotlin
-val interceptor = OhttpInterceptor(gatewayUrl, relayUrl)
+val interceptor = OhttpInterceptor(targetUrl, relayUrl)
 // ...
 interceptor.refreshKey() // blocking; throws OhttpKeyFetchException / OhttpKeyParseException
 ```

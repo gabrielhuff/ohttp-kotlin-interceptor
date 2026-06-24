@@ -37,7 +37,7 @@ class EndToEndTest {
         origin.shutdown()
     }
 
-    private val gatewayUrl = "https://api.example.com".toHttpUrl()
+    private val targetUrl = "https://api.example.com".toHttpUrl()
 
     private fun makeClient(interceptor: OhttpInterceptor = makeInterceptor()): OkHttpClient =
         OkHttpClient.Builder().addInterceptor(interceptor).build()
@@ -47,7 +47,7 @@ class EndToEndTest {
     // proving the seed alone serves these tests.
     private fun makeInterceptor(): OhttpInterceptor =
         OhttpInterceptor(
-            gatewayUrl = gatewayUrl,
+            targetUrl = targetUrl,
             relayUrl = infra.relay.url,
             defaultKeyConfigBytes = infra.gateway.keyConfigBytes,
         )
@@ -138,7 +138,7 @@ class EndToEndTest {
         // published well-known endpoint before it can encapsulate.
         val client = makeClient(
             OhttpInterceptor(
-                gatewayUrl = gatewayUrl,
+                targetUrl = targetUrl,
                 relayUrl = infra.relay.url,
                 keyConfigUrl = infra.keyDistributor.keyConfigUrl,
             )
@@ -161,7 +161,7 @@ class EndToEndTest {
         // so the post-rotation refresh can succeed.
         val client = makeClient(
             OhttpInterceptor(
-                gatewayUrl = gatewayUrl,
+                targetUrl = targetUrl,
                 relayUrl = infra.relay.url,
                 keyConfigUrl = infra.keyDistributor.keyConfigUrl,
                 defaultKeyConfigBytes = infra.gateway.keyConfigBytes,
@@ -194,7 +194,7 @@ class EndToEndTest {
         try {
             val client = makeClient(
                 OhttpInterceptor(
-                    gatewayUrl = gatewayUrl,
+                    targetUrl = targetUrl,
                     relayUrl = infra.relay.url,
                     keyConfigUrl = wrongDistributor.keyConfigUrl,
                     defaultKeyConfigBytes = wrongKeyConfigBytes,
@@ -216,7 +216,7 @@ class EndToEndTest {
     fun `a failing key endpoint surfaces as OhttpKeyFetchException`() {
         val client = makeClient(
             OhttpInterceptor(
-                gatewayUrl = gatewayUrl,
+                targetUrl = targetUrl,
                 relayUrl = infra.relay.url,
                 // Reachable host, but no key configuration published there.
                 keyConfigUrl = origin.url("/.well-known/ohttp-gateway"),

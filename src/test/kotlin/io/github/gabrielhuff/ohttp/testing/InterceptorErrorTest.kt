@@ -30,7 +30,7 @@ import java.io.IOException
  */
 class InterceptorErrorTest {
 
-    private val gatewayUrl = "https://api.example.com".toHttpUrl()
+    private val targetUrl = "https://api.example.com".toHttpUrl()
     private lateinit var fakeRelay: MockWebServer
 
     @BeforeEach
@@ -56,7 +56,7 @@ class InterceptorErrorTest {
 
     private fun seededClient(): OkHttpClient =
         OkHttpClient.Builder()
-            .addInterceptor(OhttpInterceptor(gatewayUrl, fakeRelay.url("/"), defaultKeyConfigBytes = gatewayKeyConfigBytes()))
+            .addInterceptor(OhttpInterceptor(targetUrl, fakeRelay.url("/"), defaultKeyConfigBytes = gatewayKeyConfigBytes()))
             .build()
 
     private fun get(client: OkHttpClient) =
@@ -117,7 +117,7 @@ class InterceptorErrorTest {
                 MockResponse().setResponseCode(200).setHeader("Content-Type", "application/ohttp-keys").setBody("not a key config"),
             )
             val client = OkHttpClient.Builder()
-                .addInterceptor(OhttpInterceptor(gatewayUrl, fakeRelay.url("/"), keyConfigUrl = keyServer.url("/keys")))
+                .addInterceptor(OhttpInterceptor(targetUrl, fakeRelay.url("/"), keyConfigUrl = keyServer.url("/keys")))
                 .build()
 
             assertThrows<OhttpKeyParseException> { get(client) }
@@ -131,7 +131,7 @@ class InterceptorErrorTest {
         val keyServer = MockWebServer().apply { start() }
         try {
             keyServer.enqueue(MockResponse().setResponseCode(404))
-            val interceptor = OhttpInterceptor(gatewayUrl, fakeRelay.url("/"), keyConfigUrl = keyServer.url("/keys"))
+            val interceptor = OhttpInterceptor(targetUrl, fakeRelay.url("/"), keyConfigUrl = keyServer.url("/keys"))
 
             assertThrows<OhttpKeyFetchException> { interceptor.refreshKey() }
         } finally {
