@@ -46,10 +46,10 @@ class KeyConfigManagerTest {
         server.shutdown()
     }
 
-    // Parseable config bytes — no real crypto needed, the manager only parses.
+    // Parseable "application/ohttp-keys" bytes — no real crypto needed, the manager only parses.
     private fun keyConfigBytes(keyId: Int): ByteArray =
-        KeyConfig.serialize(
-            KeyConfig(keyId, 0x0020, ByteArray(32) { it.toByte() }, listOf(KeyConfig.SymmetricAlgorithmPair(0x0001, 0x0001))),
+        KeyConfig.serializeKeys(
+            listOf(KeyConfig(keyId, 0x0020, ByteArray(32) { it.toByte() }, listOf(KeyConfig.SymmetricAlgorithmPair(0x0001, 0x0001)))),
         )
 
     private fun manager(default: ByteArray? = null) =

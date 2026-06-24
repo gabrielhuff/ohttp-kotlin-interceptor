@@ -99,4 +99,32 @@ class KeyConfigTest {
             config(kemId = 0x0021, npk = 56).pickSupportedSuite()
         }
     }
+
+    @Test
+    fun `serializeKeys then parseKeys round-trips an ohttp-keys collection`() {
+        val a = config(keyId = 1)
+        val b = config(keyId = 2, kemId = 0x0010, npk = 65, pairs = listOf(0x0001 to 0x0002))
+        val parsed = KeyConfig.parseKeys(KeyConfig.serializeKeys(listOf(a, b)))
+        assertEquals(2, parsed.size)
+        assertEquals(1, parsed[0].keyId)
+        assertEquals(2, parsed[1].keyId)
+        assertEquals(0x0010, parsed[1].kemId)
+        assertArrayEquals(b.publicKey, parsed[1].publicKey)
+    }
+
+    @Test
+    fun `parseKeys rejects a collection with a length prefix that overruns the buffer`() {
+        val config = KeyConfig.serialize(config())
+        // Prefix claims one more byte than is present.
+        val bytes = ByteBuffer.allocate(2 + config.size)
+            .putShort((config.size + 1).toShort())
+            .put(config)
+            .array()
+        assertThrows<IllegalArgumentException> { KeyConfig.parseKeys(bytes) }
+    }
+
+    @Test
+    fun `parseKeys rejects an empty collection`() {
+        assertThrows<IllegalArgumentException> { KeyConfig.parseKeys(ByteArray(0)) }
+    }
 }

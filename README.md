@@ -66,8 +66,10 @@ else through.
   built from `context.cacheDir`) for persistence, or one routed through the relay
   for stronger metadata privacy.
 * `defaultKeyConfigBytes` — optional initial key configuration to seed the
-  in-memory cache so the first request needs no round trip. Unparseable bytes are
-  ignored — the interceptor just fetches instead.
+  in-memory cache so the first request needs no round trip, in the
+  `application/ohttp-keys` collection format (RFC 9458 §3.2) — the same bytes the
+  key endpoint serves. Unparseable bytes are ignored — the interceptor just
+  fetches instead.
 
 The encapsulated request is sent to the relay via `chain.proceed`, so the relay
 leg reuses the same `OkHttpClient` (connection pool, timeouts, proxy). Because

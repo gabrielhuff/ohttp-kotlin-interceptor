@@ -49,8 +49,8 @@ class InterceptorErrorTest {
         val suite = Ohttp.HpkeSuite(0x0020, 0x0001, 0x0001)
         val keyPair = suite.hpke.generatePrivateKey()
         val publicKey = suite.hpke.serializePublicKey(keyPair.public)
-        return Ohttp.KeyConfig.serialize(
-            Ohttp.KeyConfig(0x01, 0x0020, publicKey, listOf(Ohttp.KeyConfig.SymmetricAlgorithmPair(0x0001, 0x0001))),
+        return Ohttp.KeyConfig.serializeKeys(
+            listOf(Ohttp.KeyConfig(0x01, 0x0020, publicKey, listOf(Ohttp.KeyConfig.SymmetricAlgorithmPair(0x0001, 0x0001)))),
         )
     }
 

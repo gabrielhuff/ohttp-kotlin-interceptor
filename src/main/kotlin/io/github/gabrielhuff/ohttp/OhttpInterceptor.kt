@@ -46,9 +46,10 @@ import okhttp3.Response
  *   default is a fresh, cache-less [OkHttpClient]; supply one backed by an
  *   [okhttp3.Cache] (e.g. on Android, with `context.cacheDir`) for persistence,
  *   or one routed through the relay for stronger metadata privacy.
- * @param defaultKeyConfigBytes optional initial key configuration (RFC 9458
- *   §3.1) to seed the cache. Unparseable bytes are ignored — the first request
- *   fetches instead.
+ * @param defaultKeyConfigBytes optional initial key configuration to seed the
+ *   cache, in the "application/ohttp-keys" collection format (RFC 9458 §3.2) —
+ *   the same bytes the key endpoint serves. Unparseable bytes are ignored, and
+ *   the first request fetches instead.
  */
 public class OhttpInterceptor @JvmOverloads constructor(
     private val targetUrl: HttpUrl,
