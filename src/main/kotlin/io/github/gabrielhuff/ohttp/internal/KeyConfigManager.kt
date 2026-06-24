@@ -91,7 +91,8 @@ internal class KeyConfigManager(
     }
 
     private companion object {
-        // RFC 9540 key configuration media type.
+        // application/ohttp-keys (RFC 9458) — the Accept media type for the
+        // RFC 9540 §6 key-configuration fetch.
         const val KEY_CONFIG_MEDIA_TYPE = "application/ohttp-keys"
     }
 }

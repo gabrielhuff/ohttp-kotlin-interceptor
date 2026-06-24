@@ -91,8 +91,8 @@ public class OhttpInterceptor @JvmOverloads constructor(
     }
 
     private companion object {
-        // RFC 9540 §5 — the Oblivious Gateway Resource (which serves the key
-        // configuration) lives at this well-known URI on the target's host.
+        // RFC 9540 §5 locates the Oblivious Gateway Resource at this well-known
+        // URI on the target's host; its key configuration is fetched there (§6).
         fun wellKnownKeyConfigUrl(targetUrl: HttpUrl): HttpUrl =
             targetUrl.newBuilder()
                 .encodedPath("/.well-known/ohttp-gateway")
