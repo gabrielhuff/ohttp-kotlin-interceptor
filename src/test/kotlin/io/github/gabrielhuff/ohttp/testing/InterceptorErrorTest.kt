@@ -127,14 +127,6 @@ class InterceptorErrorTest {
     }
 
     @Test
-    fun `rejects a non-loopback plaintext relay url`() {
-        // RFC 9458 §6 requires https for the client->relay leg (loopback excepted).
-        assertThrows<IllegalArgumentException> {
-            OhttpInterceptor(targetUrl, "http://relay.example".toHttpUrl(), defaultKeyConfigBytes = gatewayKeyConfigBytes())
-        }
-    }
-
-    @Test
     fun `refreshKey throws OhttpKeyFetchException when the key endpoint fails`() {
         val keyServer = MockWebServer().apply { start() }
         try {

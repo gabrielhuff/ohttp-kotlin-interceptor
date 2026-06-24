@@ -55,8 +55,9 @@ else through.
   relay or gateway. Requests are intercepted when their host matches
   `targetUrl.host`; all other requests pass through untouched.
 * `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
-  relay endpoint. Must be HTTPS (RFC 9458 §6); loopback hosts are allowed for
-  in-process testing. The same requirement applies to `keyConfigUrl`.
+  relay endpoint. RFC 9458 §6 requires the client→relay and key-config legs to
+  use HTTPS; the interceptor does not enforce this, so it is the caller's
+  responsibility to pass HTTPS URLs for `relayUrl` and `keyConfigUrl`.
 * `keyConfigUrl` — where the gateway's OHTTP Key Configuration (RFC 9458 §3.1) is
   fetched from. Defaults to `https://{target-host}/.well-known/ohttp-gateway`;
   **RFC 9540 §5** defines that Oblivious Gateway Resource on the target's host.

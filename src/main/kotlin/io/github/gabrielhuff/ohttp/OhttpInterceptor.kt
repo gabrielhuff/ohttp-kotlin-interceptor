@@ -62,13 +62,6 @@ public class OhttpInterceptor @JvmOverloads constructor(
 
     private val keys = KeyConfigManager(keyConfigUrl, keyConfigClient, defaultKeyConfigBytes)
 
-    init {
-        // RFC 9458 §6: client->relay and the key-config fetch MUST use HTTPS.
-        // Loopback is allowed so in-process/test deployments can use plain HTTP.
-        requireSecure(relayUrl, "relayUrl")
-        requireSecure(keyConfigUrl, "keyConfigUrl")
-    }
-
     /**
      * Forces a refetch of the gateway's key configuration from `keyConfigUrl`.
      * Blocks on network I/O, so call it off the main thread. Throws
@@ -118,14 +111,5 @@ public class OhttpInterceptor @JvmOverloads constructor(
                 .query(null)
                 .fragment(null)
                 .build()
-
-        fun requireSecure(url: HttpUrl, name: String) {
-            require(url.isHttps || isLoopback(url.host)) {
-                "$name must use https (RFC 9458 §6); got ${url.scheme}://${url.host}"
-            }
-        }
-
-        fun isLoopback(host: String): Boolean =
-            host == "localhost" || host == "::1" || host.startsWith("127.")
     }
 }
