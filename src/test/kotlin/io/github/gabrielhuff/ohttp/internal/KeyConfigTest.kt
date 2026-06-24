@@ -71,6 +71,18 @@ class KeyConfigTest {
     }
 
     @Test
+    fun `parse rejects a symmetric algorithms length below the minimum of 4`() {
+        // keyId | kemId(X25519) | 32-byte key | symLen = 0
+        val bytes = ByteBuffer.allocate(1 + 2 + 32 + 2)
+            .put(0x01)
+            .putShort(0x0020)
+            .put(ByteArray(32))
+            .putShort(0)
+            .array()
+        assertThrows<IllegalArgumentException> { KeyConfig.parse(bytes) }
+    }
+
+    @Test
     fun `parse rejects an unknown KEM id`() {
         // keyId | kemId=0x00FF (unknown) — fails before reading the key.
         val bytes = byteArrayOf(0x01, 0x00, 0xFF.toByte())
@@ -98,5 +110,33 @@ class KeyConfigTest {
         assertThrows<IllegalStateException> {
             config(kemId = 0x0021, npk = 56).pickSupportedSuite()
         }
+    }
+
+    @Test
+    fun `serializeKeys then parseKeys round-trips an ohttp-keys collection`() {
+        val a = config(keyId = 1)
+        val b = config(keyId = 2, kemId = 0x0010, npk = 65, pairs = listOf(0x0001 to 0x0002))
+        val parsed = KeyConfig.parseKeys(KeyConfig.serializeKeys(listOf(a, b)))
+        assertEquals(2, parsed.size)
+        assertEquals(1, parsed[0].keyId)
+        assertEquals(2, parsed[1].keyId)
+        assertEquals(0x0010, parsed[1].kemId)
+        assertArrayEquals(b.publicKey, parsed[1].publicKey)
+    }
+
+    @Test
+    fun `parseKeys rejects a collection with a length prefix that overruns the buffer`() {
+        val config = KeyConfig.serialize(config())
+        // Prefix claims one more byte than is present.
+        val bytes = ByteBuffer.allocate(2 + config.size)
+            .putShort((config.size + 1).toShort())
+            .put(config)
+            .array()
+        assertThrows<IllegalArgumentException> { KeyConfig.parseKeys(bytes) }
+    }
+
+    @Test
+    fun `parseKeys rejects an empty collection`() {
+        assertThrows<IllegalArgumentException> { KeyConfig.parseKeys(ByteArray(0)) }
     }
 }

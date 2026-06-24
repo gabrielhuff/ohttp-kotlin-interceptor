@@ -14,6 +14,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -37,7 +38,7 @@ class EndToEndTest {
         origin.shutdown()
     }
 
-    private val gatewayUrl = "https://api.example.com".toHttpUrl()
+    private val targetUrl = "https://api.example.com".toHttpUrl()
 
     private fun makeClient(interceptor: OhttpInterceptor = makeInterceptor()): OkHttpClient =
         OkHttpClient.Builder().addInterceptor(interceptor).build()
@@ -47,7 +48,7 @@ class EndToEndTest {
     // proving the seed alone serves these tests.
     private fun makeInterceptor(): OhttpInterceptor =
         OhttpInterceptor(
-            gatewayUrl = gatewayUrl,
+            targetUrl = targetUrl,
             relayUrl = infra.relay.url,
             defaultKeyConfigBytes = infra.gateway.keyConfigBytes,
         )
@@ -116,6 +117,22 @@ class EndToEndTest {
     }
 
     @Test
+    fun `100-continue expectation is stripped before encapsulation`() {
+        origin.enqueue(MockResponse().setResponseCode(200).setBody("ok"))
+
+        val response = makeClient().newCall(
+            Request.Builder()
+                .url("https://api.example.com/v1/status")
+                .header("Expect", "100-continue")
+                .build()
+        ).execute()
+
+        assertEquals("ok", response.body!!.string())
+        // The expectation must not reach the target (RFC 9458 §5.1).
+        assertNull(origin.takeRequest().getHeader("Expect"))
+    }
+
+    @Test
     fun `unconfigured hosts are not intercepted`() {
         // No relay involved — request goes straight to the origin like a normal call.
         origin.enqueue(MockResponse().setResponseCode(204))
@@ -138,7 +155,7 @@ class EndToEndTest {
         // published well-known endpoint before it can encapsulate.
         val client = makeClient(
             OhttpInterceptor(
-                gatewayUrl = gatewayUrl,
+                targetUrl = targetUrl,
                 relayUrl = infra.relay.url,
                 keyConfigUrl = infra.keyDistributor.keyConfigUrl,
             )
@@ -161,7 +178,7 @@ class EndToEndTest {
         // so the post-rotation refresh can succeed.
         val client = makeClient(
             OhttpInterceptor(
-                gatewayUrl = gatewayUrl,
+                targetUrl = targetUrl,
                 relayUrl = infra.relay.url,
                 keyConfigUrl = infra.keyDistributor.keyConfigUrl,
                 defaultKeyConfigBytes = infra.gateway.keyConfigBytes,
@@ -194,7 +211,7 @@ class EndToEndTest {
         try {
             val client = makeClient(
                 OhttpInterceptor(
-                    gatewayUrl = gatewayUrl,
+                    targetUrl = targetUrl,
                     relayUrl = infra.relay.url,
                     keyConfigUrl = wrongDistributor.keyConfigUrl,
                     defaultKeyConfigBytes = wrongKeyConfigBytes,
@@ -216,7 +233,7 @@ class EndToEndTest {
     fun `a failing key endpoint surfaces as OhttpKeyFetchException`() {
         val client = makeClient(
             OhttpInterceptor(
-                gatewayUrl = gatewayUrl,
+                targetUrl = targetUrl,
                 relayUrl = infra.relay.url,
                 // Reachable host, but no key configuration published there.
                 keyConfigUrl = origin.url("/.well-known/ohttp-gateway"),

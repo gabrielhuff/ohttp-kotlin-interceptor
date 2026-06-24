@@ -35,7 +35,7 @@ internal class KeyConfigManager(
     // throws is being unable to obtain *any* usable key at request time.
     @Volatile
     private var current: Ohttp.KeyConfig? =
-        defaultKeyConfigBytes?.let { runCatching { Ohttp.KeyConfig.parse(it) }.getOrNull() }
+        defaultKeyConfigBytes?.let { runCatching { select(it) }.getOrNull() }
 
     private val fetchLock = Any()
 
@@ -60,13 +60,19 @@ internal class KeyConfigManager(
 
         val bytes = fetch(forceNetwork)
         val parsed = try {
-            Ohttp.KeyConfig.parse(bytes)
+            select(bytes)
         } catch (e: Exception) {
             throw OhttpKeyParseException("failed to parse key configuration from $keyConfigUrl", e)
         }
         current = parsed
         parsed
     }
+
+    // Parses an "application/ohttp-keys" collection (RFC 9458 §3.2) and picks the
+    // first configuration whose KEM/KDF/AEAD we support.
+    private fun select(bytes: ByteArray): Ohttp.KeyConfig =
+        Ohttp.KeyConfig.parseKeys(bytes).firstOrNull { it.supportedSuiteOrNull() != null }
+            ?: throw IllegalArgumentException("no supported key configuration in collection")
 
     private fun fetch(forceNetwork: Boolean): ByteArray {
         val request = Request.Builder()
@@ -91,7 +97,8 @@ internal class KeyConfigManager(
     }
 
     private companion object {
-        // RFC 9540 §4.1 key configuration media type.
+        // application/ohttp-keys (RFC 9458) — the Accept media type for the
+        // RFC 9540 §6 key-configuration fetch.
         const val KEY_CONFIG_MEDIA_TYPE = "application/ohttp-keys"
     }
 }

@@ -28,7 +28,7 @@ import okhttp3.Request
 val client = OkHttpClient.Builder()
     .addInterceptor(
         OhttpInterceptor(
-            gatewayUrl = "https://api.example.com".toHttpUrl(),
+            targetUrl = "https://api.example.com".toHttpUrl(),
             relayUrl = "https://relay.fastly-edge.example/ohttp".toHttpUrl(),
             // Optional: seed the key so the first request needs no fetch.
             // Omit it and the key is pulled from the well-known endpoint instead.
@@ -42,29 +42,36 @@ val client = OkHttpClient.Builder()
 client.newCall(Request.Builder().url("https://api.example.com/v1/things").build()).execute()
 ```
 
-### One gateway per interceptor
+### One target per interceptor
 
-Each `OhttpInterceptor` handles a single gateway. To proxy more than one
-gateway, install one interceptor per gateway on the same client — each only
-acts on requests whose host matches its own `gatewayUrl` and passes everything
+Each `OhttpInterceptor` handles a single target. To proxy more than one
+target, install one interceptor per target on the same client — each only
+acts on requests whose host matches its own `targetUrl` and passes everything
 else through.
 
 ### Configuration model
 
-* `gatewayUrl` — the gateway being proxied. Requests are intercepted when their
-  host matches `gatewayUrl.host`; all other requests pass through untouched.
+* `targetUrl` — the target resource being proxied; callers address this, not the
+  relay or gateway. Requests are intercepted when their host matches
+  `targetUrl.host`; all other requests pass through untouched.
 * `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
-  relay endpoint.
+  relay endpoint. RFC 9458 §6 requires the client→relay and key-config legs to
+  use HTTPS; the interceptor does not enforce this, so it is the caller's
+  responsibility to pass HTTPS URLs for `relayUrl` and `keyConfigUrl`.
 * `keyConfigUrl` — where the gateway's OHTTP Key Configuration (RFC 9458 §3.1) is
-  fetched from. Defaults to the **RFC 9540 §4.1** well-known endpoint derived
-  from `gatewayUrl` (`https://{gateway-host}/.well-known/ohttp-gateway`).
+  fetched from. Defaults to `https://{target-host}/.well-known/ohttp-gateway`;
+  **RFC 9540 §5** defines that Oblivious Gateway Resource on the target's host.
+  Set it explicitly for deployments that publish the key configuration elsewhere
+  or distribute it out of band.
 * `keyConfigClient` — the `OkHttpClient` used for that fetch. The default is a
   fresh, cache-less client. Supply one backed by an `okhttp3.Cache` (on Android,
   built from `context.cacheDir`) for persistence, or one routed through the relay
   for stronger metadata privacy.
 * `defaultKeyConfigBytes` — optional initial key configuration to seed the
-  in-memory cache so the first request needs no round trip. Unparseable bytes are
-  ignored — the interceptor just fetches instead.
+  in-memory cache so the first request needs no round trip, in the
+  `application/ohttp-keys` collection format (RFC 9458 §3.2) — the same bytes the
+  key endpoint serves. Unparseable bytes are ignored — the interceptor just
+  fetches instead.
 
 The encapsulated request is sent to the relay via `chain.proceed`, so the relay
 leg reuses the same `OkHttpClient` (connection pool, timeouts, proxy). Because
@@ -80,10 +87,19 @@ affected request is rejected, the interceptor refetches the config from
 refresh proactively — e.g. on app foreground:
 
 ```kotlin
-val interceptor = OhttpInterceptor(gatewayUrl, relayUrl)
+val interceptor = OhttpInterceptor(targetUrl, relayUrl)
 // ...
 interceptor.refreshKey() // blocking; throws OhttpKeyFetchException / OhttpKeyParseException
 ```
+
+Detecting an outdated key is necessarily heuristic: RFC 9458 §5.3 notes a client
+"cannot rely on" the gateway's `ohttp-key` problem type, so the interceptor
+refreshes on a non-encapsulated `4xx` from the relay/gateway. That signal also
+makes the retry replay-safe — §5.2 ties a non-encapsulated error to a failure
+*before* decapsulation, i.e. the request was never processed.
+
+`Date`-based anti-replay (RFC 9458 §6.5) is not implemented: requests carry no
+`Date` header and the interceptor does not perform the §6.5.2 clock-skew retry.
 
 ### Errors
 

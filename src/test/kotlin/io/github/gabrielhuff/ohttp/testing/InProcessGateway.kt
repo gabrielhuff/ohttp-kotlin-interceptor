@@ -73,7 +73,8 @@ internal class InProcessGateway(
         return KeyState(
             gatewayKey = Ohttp.GatewayKey(keyId, suite, privateKey, publicKey),
             keyConfig = keyConfig,
-            keyConfigBytes = Ohttp.KeyConfig.serialize(keyConfig),
+            // Published as an "application/ohttp-keys" collection (RFC 9458 §3.2).
+            keyConfigBytes = Ohttp.KeyConfig.serializeKeys(listOf(keyConfig)),
         )
     }
 

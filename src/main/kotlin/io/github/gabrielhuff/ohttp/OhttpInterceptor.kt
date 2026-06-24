@@ -5,13 +5,14 @@ import io.github.gabrielhuff.ohttp.internal.Ohttp
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 
 /**
- * OkHttp [Interceptor] that turns regular HTTP(S) calls to a single gateway
+ * OkHttp [Interceptor] that turns regular HTTP(S) calls to a single target
  * host into Oblivious HTTP exchanges (RFC 9458). Requests whose host does not
- * match [gatewayUrl] are passed through unchanged. To proxy more than one
- * gateway, install one interceptor per gateway.
+ * match [targetUrl] are passed through unchanged. To proxy more than one
+ * target, install one interceptor per target.
  *
  * For each matching request, the interceptor serializes it to BHTTP (RFC 9292),
  * encapsulates it with HPKE using the gateway's public key, POSTs the result to
@@ -26,29 +27,35 @@ import okhttp3.Response
  * interceptor, so there is no risk of recursively encapsulating it.
  *
  * **Key management.** The gateway's key configuration is fetched from
- * [keyConfigUrl] (defaulting to the RFC 9540 §4.1 well-known endpoint derived
- * from [gatewayUrl]) using [keyConfigClient], and cached in memory. If
+ * [keyConfigUrl] (defaulting to the well-known endpoint on [targetUrl]'s host —
+ * RFC 9540 §5 places the Oblivious Gateway Resource there) using
+ * [keyConfigClient], and cached in memory. If
  * [defaultKeyConfigBytes] is supplied and parseable it seeds that cache so the
  * first request needs no round trip. When the gateway rotates keys, the first
  * affected request is rejected, the interceptor refreshes the key, and retries
  * once. Callers may also call [refreshKey] proactively (e.g. on app foreground).
  *
- * @param gatewayUrl identifies which requests to encapsulate (matched by host).
+ * @param targetUrl the target resource whose requests are encapsulated
+ *   (matched by host); callers address this, not the relay or gateway.
  * @param relayUrl where the encapsulated request is POSTed.
  * @param keyConfigUrl where the gateway's key configuration is fetched from.
- *   Defaults to `https://{gateway-host}/.well-known/ohttp-gateway`.
+ *   Defaults to `https://{target-host}/.well-known/ohttp-gateway` — RFC 9540 §5
+ *   defines that Oblivious Gateway Resource on the target's host. Set it
+ *   explicitly for deployments that publish the key configuration elsewhere or
+ *   distribute it out of band.
  * @param keyConfigClient the client used to fetch the key configuration. The
  *   default is a fresh, cache-less [OkHttpClient]; supply one backed by an
  *   [okhttp3.Cache] (e.g. on Android, with `context.cacheDir`) for persistence,
  *   or one routed through the relay for stronger metadata privacy.
- * @param defaultKeyConfigBytes optional initial key configuration (RFC 9458
- *   §3.1) to seed the cache. Unparseable bytes are ignored — the first request
- *   fetches instead.
+ * @param defaultKeyConfigBytes optional initial key configuration to seed the
+ *   cache, in the "application/ohttp-keys" collection format (RFC 9458 §3.2) —
+ *   the same bytes the key endpoint serves. Unparseable bytes are ignored, and
+ *   the first request fetches instead.
  */
 public class OhttpInterceptor @JvmOverloads constructor(
-    private val gatewayUrl: HttpUrl,
+    private val targetUrl: HttpUrl,
     private val relayUrl: HttpUrl,
-    keyConfigUrl: HttpUrl = wellKnownKeyConfigUrl(gatewayUrl),
+    keyConfigUrl: HttpUrl = wellKnownKeyConfigUrl(targetUrl),
     keyConfigClient: OkHttpClient = OkHttpClient(),
     defaultKeyConfigBytes: ByteArray? = null,
 ) : Interceptor {
@@ -67,29 +74,39 @@ public class OhttpInterceptor @JvmOverloads constructor(
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
-        if (original.url.host != gatewayUrl.host) return chain.proceed(original)
+        if (original.url.host != targetUrl.host) return chain.proceed(original)
+
+        // RFC 9458 §5.1: a 100-continue expectation cannot be used with OHTTP, so
+        // never encapsulate one (the gateway would reject it).
+        val request = original.withoutExpectContinue()
 
         return try {
-            interceptOhttp(chain)
+            interceptOhttp(chain, request)
         } catch (e: OhttpKeyMismatchException) {
             // The key was outdated/unregistered: refresh and retry exactly once.
             // A second mismatch propagates as the terminal failure.
             keys.refresh()
-            interceptOhttp(chain)
+            interceptOhttp(chain, request)
         }
     }
 
-    private fun interceptOhttp(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val (relayRequest, context) = Ohttp.encapsulateRequest(original, keys.get(), relayUrl)
-        return Ohttp.decapsulateResponse(chain.proceed(relayRequest), context, original)
+    private fun interceptOhttp(chain: Interceptor.Chain, request: Request): Response {
+        val (relayRequest, context) = Ohttp.encapsulateRequest(request, keys.get(), relayUrl)
+        return Ohttp.decapsulateResponse(chain.proceed(relayRequest), context, request)
     }
 
+    private fun Request.withoutExpectContinue(): Request =
+        if (header("Expect")?.equals("100-continue", ignoreCase = true) == true) {
+            newBuilder().removeHeader("Expect").build()
+        } else {
+            this
+        }
+
     private companion object {
-        // RFC 9540 §4.1 — the gateway publishes its key configuration at the
-        // well-known URI on its own origin.
-        fun wellKnownKeyConfigUrl(gatewayUrl: HttpUrl): HttpUrl =
-            gatewayUrl.newBuilder()
+        // RFC 9540 §5 locates the Oblivious Gateway Resource at this well-known
+        // URI on the target's host; its key configuration is fetched there (§6).
+        fun wellKnownKeyConfigUrl(targetUrl: HttpUrl): HttpUrl =
+            targetUrl.newBuilder()
                 .encodedPath("/.well-known/ohttp-gateway")
                 .query(null)
                 .fragment(null)

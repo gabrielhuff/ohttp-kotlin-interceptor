@@ -181,16 +181,19 @@ internal object Ohttp {
     ) {
         data class SymmetricAlgorithmPair(val kdfId: Int, val aeadId: Int)
 
-        // First (KDF, AEAD) pair from the config that we can actually instantiate.
-        fun pickSupportedSuite(): HpkeSuite {
-            check(kemId in SUPPORTED_KEM_IDS) { "unsupported KEM 0x${"%04x".format(kemId)}" }
+        /** The first (KDF, AEAD) pair we can instantiate for this config's KEM, or null if none. */
+        fun supportedSuiteOrNull(): HpkeSuite? {
+            if (kemId !in SUPPORTED_KEM_IDS) return null
             for (pair in symmetricAlgorithms) {
-                if (pair.kdfId !in SUPPORTED_KDF_IDS) continue
-                if (pair.aeadId !in SUPPORTED_AEAD_IDS) continue
-                return HpkeSuite(kemId.toShort(), pair.kdfId.toShort(), pair.aeadId.toShort())
+                if (pair.kdfId in SUPPORTED_KDF_IDS && pair.aeadId in SUPPORTED_AEAD_IDS) {
+                    return HpkeSuite(kemId.toShort(), pair.kdfId.toShort(), pair.aeadId.toShort())
+                }
             }
-            error("no supported symmetric algorithm pair in key config: $symmetricAlgorithms")
+            return null
         }
+
+        fun pickSupportedSuite(): HpkeSuite =
+            supportedSuiteOrNull() ?: error("no supported KEM/KDF/AEAD in key config: $this")
 
         override fun toString(): String =
             "KeyConfig(keyId=$keyId, kemId=0x${"%04x".format(kemId)}, pk=${publicKey.toHexString()}, " +
@@ -214,6 +217,9 @@ internal object Ohttp {
                 src.get(publicKey)
                 require(src.remaining() >= 2) { "key config truncated: missing symmetric algorithms length" }
                 val symLen = src.short.toInt() and 0xFFFF
+                // RFC 9458 §3.1: HPKE Symmetric Algorithms Length is 4..65532 and,
+                // being whole (KDF, AEAD) pairs, a multiple of 4.
+                require(symLen in 4..65532) { "symmetric algorithms length out of range: $symLen" }
                 require(symLen % 4 == 0) { "symmetric algorithms section must be a multiple of 4 bytes" }
                 require(src.remaining() >= symLen) { "key config truncated: missing symmetric algorithms" }
                 val syms = buildList {
@@ -237,6 +243,39 @@ internal object Ohttp {
                 for (pair in config.symmetricAlgorithms) {
                     buf.putShort(pair.kdfId.toShort())
                     buf.putShort(pair.aeadId.toShort())
+                }
+                return buf.array()
+            }
+
+            /**
+             * Parses an "application/ohttp-keys" collection (RFC 9458 §3.2): one or
+             * more [parse]-able configs, each prefixed with a 2-byte length. Per §3.2
+             * an incorrectly encoded collection is rejected wholesale (this throws),
+             * to avoid recovery differences that could be used to segregate clients.
+             */
+            fun parseKeys(bytes: ByteArray): List<KeyConfig> {
+                val src = ByteBuffer.wrap(bytes)
+                val configs = buildList {
+                    while (src.hasRemaining()) {
+                        require(src.remaining() >= 2) { "ohttp-keys collection truncated: missing length prefix" }
+                        val len = src.short.toInt() and 0xFFFF
+                        require(len in 1..src.remaining()) { "ohttp-keys collection has an invalid config length: $len" }
+                        val configBytes = ByteArray(len)
+                        src.get(configBytes)
+                        add(parse(configBytes)) // parse() requires the slice to be consumed exactly
+                    }
+                }
+                require(configs.isNotEmpty()) { "ohttp-keys collection is empty" }
+                return configs
+            }
+
+            /** Serializes configs into an "application/ohttp-keys" collection (RFC 9458 §3.2). */
+            fun serializeKeys(configs: List<KeyConfig>): ByteArray {
+                val encoded = configs.map { serialize(it) }
+                val buf = ByteBuffer.allocate(encoded.sumOf { 2 + it.size })
+                for (config in encoded) {
+                    buf.putShort(config.size.toShort())
+                    buf.put(config)
                 }
                 return buf.array()
             }
