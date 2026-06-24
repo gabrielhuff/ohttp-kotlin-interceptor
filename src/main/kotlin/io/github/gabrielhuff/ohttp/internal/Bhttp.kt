@@ -71,8 +71,8 @@ internal object Bhttp {
         val scheme = readLengthPrefixedAscii(src)
         val authority = readLengthPrefixedAscii(src)
         val path = readLengthPrefixedAscii(src)
-        val headers = readFieldSection(src)
-        val body = readContent(src)
+        val headers = readFieldSectionOrEmpty(src)
+        val body = readContentOrEmpty(src)
         // Trailers and any padding are ignored.
 
         val url = "$scheme://$authority$path".toHttpUrl()
@@ -134,10 +134,10 @@ internal object Bhttp {
         // Skip any informational (1xx) responses.
         while (true) {
             status = Varint.read(src).toInt()
-            headers = readFieldSection(src)
+            headers = readFieldSectionOrEmpty(src)
             if (status >= 200) break
         }
-        val body = readContent(src)
+        val body = readContentOrEmpty(src)
         // Trailers and any padding are ignored.
 
         val contentType = headers.firstOrNull { it.first.equals("Content-Type", ignoreCase = true) }
@@ -204,6 +204,16 @@ internal object Bhttp {
         }
         return buf.toByteArray()
     }
+
+    // RFC 9292 §3.8 allows trailing zero-length sections to be omitted, so an
+    // exhausted buffer here means the remaining sections are empty. (The Appendix A
+    // examples in RFC 9458 rely on this: a GET ends after the path, a 200 after the
+    // status code.)
+    private fun readFieldSectionOrEmpty(src: ByteBuffer): List<Pair<String, String>> =
+        if (src.hasRemaining()) readFieldSection(src) else emptyList()
+
+    private fun readContentOrEmpty(src: ByteBuffer): ByteArray =
+        if (src.hasRemaining()) readContent(src) else ByteArray(0)
 
     private fun readFieldSection(src: ByteBuffer): List<Pair<String, String>> {
         val len = Varint.read(src).toInt()

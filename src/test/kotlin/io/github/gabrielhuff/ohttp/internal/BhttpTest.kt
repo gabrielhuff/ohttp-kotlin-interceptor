@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalStdlibApi::class) // String.hexToByteArray()
+
 package io.github.gabrielhuff.ohttp.internal
 
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -84,6 +86,27 @@ class BhttpTest {
         assertEquals("qux", decoded.header("X-Baz"))
         assertEquals("hello", decoded.body!!.string())
         assertTrue(decoded.body!!.contentType().toString().startsWith("text/plain"))
+    }
+
+    @Test
+    fun `decodeRequest accepts a message that omits trailing empty sections`() {
+        // RFC 9458 Appendix A request: framing + GET https example.com / — no
+        // field section, content, or trailers (RFC 9292 §3.8).
+        val decoded = Bhttp.decodeRequest("00034745540568747470730b6578616d706c652e636f6d012f".hexToByteArray())
+        assertEquals("GET", decoded.method)
+        assertEquals("https", decoded.url.scheme)
+        assertEquals("example.com", decoded.url.host)
+        assertEquals("/", decoded.url.encodedPath)
+        assertNull(decoded.body)
+    }
+
+    @Test
+    fun `decodeResponse accepts a status-only message`() {
+        val original = Request.Builder().url("https://example.com/").build()
+        // RFC 9458 Appendix A response: framing + 200, nothing else.
+        val decoded = Bhttp.decodeResponse("0140c8".hexToByteArray(), original)
+        assertEquals(200, decoded.code)
+        assertEquals("", decoded.body!!.string())
     }
 
     @Test
