@@ -26,9 +26,9 @@ import okhttp3.Response
  * interceptor, so there is no risk of recursively encapsulating it.
  *
  * **Key management.** The gateway's key configuration is fetched from
- * [keyConfigUrl] (defaulting to the RFC 9540 §4.1 well-known endpoint derived
- * from [targetUrl], which assumes the gateway is co-located with the target)
- * using [keyConfigClient], and cached in memory. If
+ * [keyConfigUrl] (defaulting to the well-known endpoint on [targetUrl]'s host —
+ * RFC 9540 §5 places the Oblivious Gateway Resource there) using
+ * [keyConfigClient], and cached in memory. If
  * [defaultKeyConfigBytes] is supplied and parseable it seeds that cache so the
  * first request needs no round trip. When the gateway rotates keys, the first
  * affected request is rejected, the interceptor refreshes the key, and retries
@@ -38,9 +38,10 @@ import okhttp3.Response
  *   (matched by host); callers address this, not the relay or gateway.
  * @param relayUrl where the encapsulated request is POSTed.
  * @param keyConfigUrl where the gateway's key configuration is fetched from.
- *   Defaults to `https://{target-host}/.well-known/ohttp-gateway` (RFC 9540),
- *   which assumes the gateway is co-located with the target; set it explicitly
- *   if your gateway is hosted elsewhere.
+ *   Defaults to `https://{target-host}/.well-known/ohttp-gateway` — RFC 9540 §5
+ *   defines that Oblivious Gateway Resource on the target's host. Set it
+ *   explicitly for deployments that publish the key configuration elsewhere or
+ *   distribute it out of band.
  * @param keyConfigClient the client used to fetch the key configuration. The
  *   default is a fresh, cache-less [OkHttpClient]; supply one backed by an
  *   [okhttp3.Cache] (e.g. on Android, with `context.cacheDir`) for persistence,
@@ -90,8 +91,8 @@ public class OhttpInterceptor @JvmOverloads constructor(
     }
 
     private companion object {
-        // RFC 9540 §4.1 — the gateway publishes its key configuration at the
-        // well-known URI on its own origin.
+        // RFC 9540 §5 — the Oblivious Gateway Resource (which serves the key
+        // configuration) lives at this well-known URI on the target's host.
         fun wellKnownKeyConfigUrl(targetUrl: HttpUrl): HttpUrl =
             targetUrl.newBuilder()
                 .encodedPath("/.well-known/ohttp-gateway")

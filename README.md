@@ -57,10 +57,10 @@ else through.
 * `relayUrl` — where the encapsulated `POST` is sent. Typically your Fastly
   relay endpoint.
 * `keyConfigUrl` — where the gateway's OHTTP Key Configuration (RFC 9458 §3.1) is
-  fetched from. Defaults to the **RFC 9540 §4.1** well-known endpoint derived
-  from `targetUrl` (`https://{target-host}/.well-known/ohttp-gateway`), which
-  assumes the gateway is co-located with the target; set it explicitly if your
-  gateway is hosted elsewhere.
+  fetched from. Defaults to `https://{target-host}/.well-known/ohttp-gateway`;
+  **RFC 9540 §5** defines that Oblivious Gateway Resource on the target's host.
+  Set it explicitly for deployments that publish the key configuration elsewhere
+  or distribute it out of band.
 * `keyConfigClient` — the `OkHttpClient` used for that fetch. The default is a
   fresh, cache-less client. Supply one backed by an `okhttp3.Cache` (on Android,
   built from `context.cacheDir`) for persistence, or one routed through the relay
